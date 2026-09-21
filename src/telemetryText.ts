@@ -7,7 +7,8 @@ export function statusWarnings(
 ): string[] {
   return [
     ...(status.warning ? [status.warning] : []),
-    ...(status.quarantined_apps ?? []).map((row) => t.quarantineWarning(row.name, row.exe_name)),
+    ...(status.quarantined_apps ?? []).map((row) => row.reason === 'primary_path_mismatch'
+      ? t.primaryPathWarning(row.name, row.exe_name) : t.quarantineWarning(row.name, row.exe_name)),
   ];
 }
 

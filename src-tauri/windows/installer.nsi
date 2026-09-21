@@ -73,6 +73,8 @@ Var HdrUninstallFailure
 Var HdrUninstallRestoreFailed
 Var HdrUninstallRestoreDir
 Var HdrUninstallRestoreDirOwned
+Var HdrUninstallRetirementStarted
+Var HdrUninstallMetadataRestoreFailed
 
 !macro HdrCreateUninstallDirectory DIRECTORY PARENT SUFFIX FAILURE
   ClearErrors
@@ -368,6 +370,8 @@ Section "Uninstall"
   ; The ownership helper requires BOTH original executable paths on a retry.
   ; Keep recovery outside $PLUGINSDIR until success: Quit cleans $PLUGINSDIR.
   StrCpy $HdrUninstallRecovery ""
+  StrCpy $HdrUninstallRetirementStarted 0
+  StrCpy $HdrUninstallMetadataRestoreFailed 0
   ClearErrors
   InitPluginsDir
   ${If} ${Errors}
@@ -376,6 +380,16 @@ Section "Uninstall"
   !insertmacro HdrCreateUninstallDirectory $HdrUninstallRecovery "$TEMP" "hdr-uninstall-recovery" hdr_uninstall_prepare_failed
   !insertmacro HdrBackupUninstallFile "${MAINBINARYNAME}.exe"
   !insertmacro HdrBackupUninstallFile "uninstall.exe"
+  ; Persist exact ownership/registry bytes while the registered paths still
+  ; exist. The copied helper can retire or repair that receipt after deletion.
+  ClearErrors
+  ExecWait '"$HdrUninstallRecovery\${MAINBINARYNAME}.exe" --hdr-installer-retirement-prepare nsis "$INSTDIR\${MAINBINARYNAME}.exe" $HdrUiLevel' $0
+  ${If} ${Errors}
+    StrCpy $0 1
+  ${EndIf}
+  ${If} $0 != 0
+    Goto hdr_uninstall_prepare_failed
+  ${EndIf}
 
   {{#each resources}}
   !insertmacro HdrDeleteUninstallPayload "$INSTDIR\\{{this.[1]}}"
@@ -386,8 +400,23 @@ Section "Uninstall"
   !insertmacro HdrDeleteUninstallPayload "$INSTDIR\${MAINBINARYNAME}.exe"
   !insertmacro HdrDeleteUninstallPayload "$INSTDIR\uninstall.exe"
 
+  ; The transaction is not complete just because the payload is absent.
+  ; Deletion and readback of ALL owned metadata must succeed while the durable
+  ; cleanup pair and exact registry receipt are still available for recovery.
+  StrCpy $HdrUninstallFailure "Owned installation metadata retirement was not confirmed"
+  StrCpy $HdrUninstallRetirementStarted 1
+  ClearErrors
+  ExecWait '"$HdrUninstallRecovery\${MAINBINARYNAME}.exe" --hdr-installer-retirement-commit nsis "$INSTDIR\${MAINBINARYNAME}.exe" $HdrUiLevel' $0
+  ${If} ${Errors}
+    StrCpy $0 1
+  ${EndIf}
+  ${If} $0 != 0
+    Goto hdr_uninstall_failed
+  ${EndIf}
+
   ; Retire the recovery pair together only after every installed payload is
-  ; confirmed absent. A failed move still leaves both originals available.
+  ; confirmed absent AND checked registry retirement succeeds. A failed move
+  ; restores both cleanup paths before repairing the original registrations.
   StrCpy $HdrUninstallFailure "$HdrUninstallRecovery (recovery cleanup)"
   ClearErrors
   Rename "$HdrUninstallRecovery" "$PLUGINSDIR\hdr-uninstall-complete"
@@ -404,9 +433,6 @@ Section "Uninstall"
   ${If} $0 == 1
     Delete "$DESKTOP\${PRODUCTNAME}.lnk"
   ${EndIf}
-  DeleteRegKey HKCU "${UNINSTKEY}"
-  DeleteRegValue HKCU "${PRODUCTKEY}" ""
-  DeleteRegKey /ifempty HKCU "${PRODUCTKEY}"
   {{#each resources_ancestors}}
   RMDir "$INSTDIR\\{{this}}"
   {{/each}}
@@ -415,7 +441,7 @@ Section "Uninstall"
   Goto hdr_uninstall_done
 
 hdr_uninstall_prepare_failed:
-  StrCpy $0 "Uninstall blocked: recovery copies could not be prepared. No bundled file was removed; shortcuts and installation metadata were retained. Startup may already be disabled. Close file locks and retry. Any temporary recovery copies remain at: $HdrUninstallRecovery"
+  StrCpy $0 "Uninstall blocked: recovery copies or the exact registry receipt could not be prepared. No bundled file was removed; shortcuts and installation metadata were retained. Startup may already be disabled. Close file locks and retry. Any recovery copies remain at: $HdrUninstallRecovery"
   SetErrorLevel 1
   DetailPrint "$0"
   ${If} $HdrUiLevel == 5
@@ -435,6 +461,18 @@ hdr_uninstall_restore_incomplete:
   StrCpy $HdrUninstallRestoreFailed 1
 
 hdr_uninstall_restore_report:
+  ${If} $HdrUninstallRetirementStarted == 1
+    ; Verify complete, original cleanup bytes before re-registering anything.
+    ; A denied rollback must preserve this helper/receipt, not report success.
+    ClearErrors
+    ExecWait '"$HdrUninstallRecovery\${MAINBINARYNAME}.exe" --hdr-installer-retirement-restore nsis "$INSTDIR\${MAINBINARYNAME}.exe" $HdrUiLevel' $0
+    ${If} ${Errors}
+      StrCpy $0 1
+    ${EndIf}
+    ${If} $0 != 0
+      StrCpy $HdrUninstallMetadataRestoreFailed 1
+    ${EndIf}
+  ${EndIf}
   ${If} $HdrUninstallRestoreDirOwned == 1
     ClearErrors
     RMDir "$HdrUninstallRestoreDir"
@@ -443,11 +481,16 @@ hdr_uninstall_restore_report:
     ${EndIf}
   ${EndIf}
   SetErrorLevel 1
-  StrCpy $0 "Uninstall incomplete: $HdrUninstallFailure. Earlier files may be gone and startup may already be disabled. Shortcuts and installation metadata were retained; existing files were not overwritten. Close locks and retry normally (without _?=). Do not launch the app."
+  StrCpy $0 "Uninstall incomplete: $HdrUninstallFailure. Earlier files may be gone and startup may already be disabled. Shortcuts retained; existing files were not overwritten. Do not launch the app. Recovery: $HdrUninstallRecovery"
   ${If} $HdrUninstallRestoreFailed == 1
-    StrCpy $0 "$0$\r$\nAutomatic recovery was blocked. After closing locks, restore the two recovery files from $HdrUninstallRecovery to $INSTDIR only where originals are missing; do not overwrite conflicts. Do not use .restore staging files at $HdrUninstallRestoreDir. Then retry. Reinstallation cannot repair missing ownership paths."
+    StrCpy $0 "$0$\r$\nAutomatic recovery was blocked. After closing locks, restore the two recovery files only where originals are missing; do not overwrite conflicts or use .restore files. See RECOVERY.txt."
   ${Else}
-    StrCpy $0 "$0$\r$\nMissing cleanup executables were restored. Recovery copies remain at $HdrUninstallRecovery; retain them until a retry succeeds."
+    StrCpy $0 "$0$\r$\nMissing cleanup executables were restored. Keep the recovery directory until a retry succeeds."
+  ${EndIf}
+  ${If} $HdrUninstallMetadataRestoreFailed == 1
+    StrCpy $0 "$0$\r$\nInstallation metadata recovery was NOT confirmed. Resolve registry access/conflicts and run the recovery-only command in RECOVERY.txt before retrying uninstall."
+  ${Else}
+    StrCpy $0 "$0$\r$\nInstallation metadata was retained or its exact recovery was confirmed. After recovery, close locks and retry normally without _?=."
   ${EndIf}
   DetailPrint "$0"
   ${If} $HdrUiLevel == 5

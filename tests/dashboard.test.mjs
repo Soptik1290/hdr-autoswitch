@@ -27,6 +27,7 @@ const monitor = (overrides = {}) => ({
   state_error: null, is_primary: true, ...overrides,
 });
 const status = (mode = 'sdr') => ({
+  status_revision: '1', inventory_revision: '1', manual_revision: '0', manual_results: [],
   scope_hdr_state: mode, is_hdr_active: mode === 'hdr',
   manual_control: { status: 'available' }, switched_by_app: false,
   target_status: 'ready', warning: null, target_deferred: false,
@@ -39,7 +40,9 @@ function render(overrides = {}, language = 'en') {
   }, React.createElement(Dashboard, {
     status: status(), monitors: [monitor()], libraryCount: null,
     activityLogs: [], recentGames: [], onRefreshMonitors() {}, onManualToggle() {},
-    onNavigateToApps() {}, onControlError() {}, controlAvailable: true, isDark: true,
+    onNavigateToApps() {}, onControlError() {}, onManualResult() {},
+    captureManualOrigin(scope) { return { scope, request: { client_id: 'gui:test', sequence: '1' } }; },
+    controlAvailable: true, isDark: true,
     ...overrides,
   })));
 }

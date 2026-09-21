@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { HdrApp, HdrType, AppConfig, PickedGameInfo, ScanResult } from '../types';
+import { HdrApp, HdrType, AppConfig, PickedGameInfo, QuarantinedApp, ScanGame, ScanResult } from '../types';
 import type { MutationOrigin } from '../configState';
 import { configClient } from '../useConfig';
-import { findLibraryApp } from '../libraryState';
+import { captureLibraryRow, findLibraryApp, pathAfterExecutableEdit, primaryExecutable } from '../libraryState';
 import { detectionKey, importSelectedDetections, selectDetections, selectedDetections, toggleDetection } from '../scanSelection';
 import { launcherName } from '../catalogNotes';
 import { invoke } from '@tauri-apps/api/core';
@@ -32,14 +32,14 @@ import { useI18n } from '../i18n';
 
 interface AppsManagerProps {
   config: AppConfig;
-  quarantinedExes: string[];
+  quarantinedRows: QuarantinedApp[];
   onNavigateToCatalog: () => void;
   isDark: boolean;
 }
 
 export const AppsManager: React.FC<AppsManagerProps> = ({
   config,
-  quarantinedExes,
+  quarantinedRows,
   onNavigateToCatalog,
   isDark,
 }) => {
@@ -52,20 +52,21 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
 
   // Scan modal
   const [showScanModal, setShowScanModal] = useState(false);
-  const [scannedGames, setScannedGames] = useState<HdrApp[]>([]);
+  const [scannedGames, setScannedGames] = useState<ScanGame[]>([]);
   const [scanOrigin, setScanOrigin] = useState<MutationOrigin | null>(null);
   const [selectedToImport, setSelectedToImport] = useState<Record<string, boolean>>({});
   const [pathStatus, setPathStatus] = useState<Record<string, boolean>>({});
   const isQuarantined = (app: HdrApp) =>
-    quarantinedExes.some((exe) => exe.toLowerCase() === app.exe_name.toLowerCase());
+    quarantinedRows.some((row) => row.row_index === config.apps.indexOf(app)
+      && row.exe_name === app.exe_name && row.path === (app.path ?? null));
 
   const handleRepairExecutable = async (app: HdrApp) => {
     try {
-      const origin = configClient.captureOrigin();
+      const { row, origin } = captureLibraryRow(configClient, config.apps, app);
       const picked = await invoke<PickedGameInfo | null>('pick_game_exe', { language: lang });
       if (!picked) return;
       await configClient.mutate('repair_app_executable', {
-        exeName: app.exe_name, path: picked.path,
+        row, path: picked.path,
       }, origin);
     } catch (err) {
       configClient.reportError(err);
@@ -85,10 +86,10 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
     }
   }, [config.apps]);
 
-  const findExistingApp = (item: HdrApp): HdrApp | undefined =>
+  const findExistingApp = (item: ScanGame): HdrApp | undefined =>
     findLibraryApp(config.apps, item);
 
-  const isPathDifferent = (existing: HdrApp, scanned: HdrApp): boolean => {
+  const isPathDifferent = (existing: HdrApp, scanned: ScanGame): boolean => {
     if (existing.exe_name.toLowerCase() !== scanned.exe_name.toLowerCase()
         && !isQuarantined(existing)) return false;
     if (!scanned.path) return false;
@@ -107,17 +108,19 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
   const [isHdrMatched, setIsHdrMatched] = useState(false);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
 
-  const handleToggleApp = async (exeName: string, enabled: boolean) => {
+  const handleToggleApp = async (app: HdrApp, enabled: boolean) => {
     try {
-      await configClient.mutate('toggle_app', { exeName, enabled });
+      const { row, origin } = captureLibraryRow(configClient, config.apps, app);
+      await configClient.mutate('toggle_app', { row, enabled }, origin);
     } catch (err) {
       configClient.reportError(err);
     }
   };
 
-  const handleDeleteApp = async (exeName: string) => {
+  const handleDeleteApp = async (app: HdrApp) => {
     try {
-      await configClient.mutate('remove_app', { exeName });
+      const { row, origin } = captureLibraryRow(configClient, config.apps, app);
+      await configClient.mutate('remove_app', { row }, origin);
     } catch (err) {
       configClient.reportError(err);
     }
@@ -146,10 +149,9 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
           // If game is already tracked:
           // - If path moved or was newly discovered: PRE-SELECT to update path!
           // - If already up to date: uncheck by default
-          return pathChanged;
+          return item.default_selected && pathChanged;
         } else {
-          // New game: pre-select HDR games, leave SDR unselected by default
-          return item.enabled;
+          return item.default_selected;
         }
       });
       setSelectedToImport(initialSelected);
@@ -164,7 +166,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
   };
 
   const selectAllHdr = () => {
-    setSelectedToImport(selectDetections(scannedGames, (item) => item.enabled));
+    setSelectedToImport(selectDetections(scannedGames, (item) => item.is_hdr_supported));
   };
 
   const selectAll = () => {
@@ -182,7 +184,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
         setNewName(picked.name);
         setNewExe(picked.exe_name);
         setNewPath(picked.path);
-        setNewType(picked.hdr_type.toLowerCase() as HdrType);
+        setNewType(picked.hdr_type);
         setIsHdrMatched(picked.is_hdr_supported);
         setShowAddModal(true);
       }
@@ -203,7 +205,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
             setNewName(picked.name);
             setNewExe(picked.exe_name);
             setNewPath(picked.path);
-            setNewType(picked.hdr_type.toLowerCase() as HdrType);
+            setNewType(picked.hdr_type);
             setIsHdrMatched(picked.is_hdr_supported);
             setShowAddModal(true);
           } catch (err) {
@@ -242,8 +244,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
     e.preventDefault();
     if (!newName.trim() || !newExe.trim()) return;
 
-    let cleanExe = newExe.trim().toLowerCase();
-    if (!cleanExe.endsWith('.exe')) cleanExe += '.exe';
+    const cleanExe = primaryExecutable(newExe);
 
     const newApp: HdrApp = {
       name: newName.trim(),
@@ -489,7 +490,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
 
             return (
               <div
-                key={app.exe_name}
+                key={config.apps.indexOf(app)}
                 className={`relative group border overflow-hidden flex flex-col justify-between transition-all duration-200 ${
                   app.enabled
                     ? isDark
@@ -562,7 +563,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                   <div className="flex items-center justify-between pt-0.5">
                     {/* Toggle button */}
                     <button
-                      onClick={() => handleToggleApp(app.exe_name, !app.enabled)}
+                      onClick={() => handleToggleApp(app, !app.enabled)}
                       disabled={isQuarantined(app)}
                       className={`px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider cursor-pointer border transition-all ${
                         app.enabled
@@ -586,7 +587,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                       </button>
                     )}
                     <button
-                      onClick={() => handleDeleteApp(app.exe_name)}
+                      onClick={() => handleDeleteApp(app)}
                       className={`p-1 cursor-pointer transition-colors ${
                         isDark ? 'text-[#8a7f81] hover:text-[#f55a6b]' : 'text-slate-400 hover:text-rose-600'
                       }`}
@@ -610,7 +611,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
 
             return (
               <div
-                key={app.exe_name}
+                key={config.apps.indexOf(app)}
                 className={`p-3 border transition-all flex items-center justify-between gap-4 relative ${
                   app.enabled
                     ? isDark
@@ -665,7 +666,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
 
                 <div className="flex items-center gap-3 shrink-0">
                   <button
-                    onClick={() => handleToggleApp(app.exe_name, !app.enabled)}
+                    onClick={() => handleToggleApp(app, !app.enabled)}
                     disabled={isQuarantined(app)}
                     className={`px-2.5 py-1 text-xs font-bold uppercase tracking-wider cursor-pointer border transition-all ${
                       app.enabled
@@ -688,7 +689,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                     </button>
                   )}
                   <button
-                    onClick={() => handleDeleteApp(app.exe_name)}
+                    onClick={() => handleDeleteApp(app)}
                     className={`p-1.5 cursor-pointer transition-colors ${
                       isDark ? 'text-[#8a7f81] hover:text-[#f55a6b]' : 'text-slate-400 hover:text-rose-600'
                     }`}
@@ -705,8 +706,8 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
 
       {/* Scan Modal */}
       {showScanModal && (() => {
-        const hdrGames = scannedGames.filter((g) => g.enabled);
-        const sdrGames = scannedGames.filter((g) => !g.enabled);
+        const hdrGames = scannedGames.filter((g) => g.is_hdr_supported);
+        const unverifiedGames = scannedGames.filter((g) => !g.is_hdr_supported);
         const selectedCount = selectedDetections(scannedGames, selectedToImport).length;
 
         return (
@@ -736,6 +737,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
                 <p className={isDark ? 'text-[#8a7f81]' : 'text-slate-500'}>
                   {t.scanModalSubtitle}
+                  <span className="block mt-1">{t.appsHelperAliasCleanup}</span>
                 </p>
                 <div className="flex items-center gap-2 flex-shrink-0">
                   <button
@@ -775,7 +777,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
               </div>
 
               <div className="flex-1 overflow-y-auto space-y-4 pr-1">
-                {/* SECTION 1: HDR Games (Top, Pre-selected) */}
+                {/* Verified support is independent of import selection. */}
                 {hdrGames.length > 0 && (
                   <div className="space-y-2">
                     <div className={`flex items-center justify-between px-2 py-1.5 border-l-2 ${
@@ -787,7 +789,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                         <Sparkles className={`w-4 h-4 ${isDark ? 'text-[#5accf5]' : 'text-sky-600'}`} />
                         <span>{t.scanModalSectionHdr(hdrGames.length)}</span>
                       </div>
-                      <span className="text-[10px] font-mono opacity-80">[AUTO ON]</span>
+                      <span className="text-[10px] font-mono opacity-80">[HDR]</span>
                     </div>
 
                     <div className="space-y-1.5">
@@ -880,8 +882,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                   </div>
                 )}
 
-                {/* SECTION 2: SDR Games (Bottom, Unchecked by default) */}
-                {sdrGames.length > 0 && (
+                {unverifiedGames.length > 0 && (
                   <div className="space-y-2">
                     <div className={`flex items-center justify-between px-2 py-1.5 border-l-2 ${
                       isDark
@@ -890,13 +891,13 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                     }`}>
                       <div className="flex items-center gap-2 text-xs font-bold uppercase">
                         <Gamepad2 className={`w-4 h-4 ${isDark ? 'text-[#8a7f81]' : 'text-slate-500'}`} />
-                        <span>{t.scanModalSectionSdr(sdrGames.length)}</span>
+                        <span>{t.scanModalSectionSdr(unverifiedGames.length)}</span>
                       </div>
                       <span className="text-[10px] font-mono opacity-80">[AUTO OFF]</span>
                     </div>
 
                     <div className="space-y-1.5">
-                      {sdrGames.map((game) => {
+                      {unverifiedGames.map((game) => {
                         const isSelected = !!selectedToImport[detectionKey(game)];
                         const existing = findExistingApp(game);
                         const pathChanged = existing ? isPathDifferent(existing, game) : false;
@@ -931,10 +932,9 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                                 <span className={`text-[9px] px-1.5 py-0.2 border font-mono uppercase ${
                                   isDark ? 'bg-white/5 border-white/10 text-[#8a7f81]' : 'bg-slate-100 border-slate-300 text-slate-600'
                                 }`}>
-                                  SDR
+                                  {t.scanModalSupportUnverified}
                                 </span>
 
-                                {/* Status Badges for SDR */}
                                 {pathChanged && (
                                   <span className={`text-[9px] px-1.5 py-0.2 border font-mono font-bold uppercase tracking-wider flex items-center gap-1 ${
                                     isDark ? 'bg-amber-500/15 border-amber-500/60 text-amber-300' : 'bg-amber-50 border-amber-400 text-amber-800'
@@ -1031,6 +1031,10 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
               </button>
             </div>
 
+            <p className={`text-[10px] ${isDark ? 'text-[#8a7f81]' : 'text-slate-500'}`}>
+              {t.appsHelperAliasCleanup}
+            </p>
+
             {/* Interactive File Dropzone & Browse Button */}
             <div
               onClick={handleBrowseExe}
@@ -1118,7 +1122,11 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                     required
                     placeholder={t.manualExePlaceholder}
                     value={newExe}
-                    onChange={(e) => setNewExe(e.target.value)}
+                    onChange={(e) => {
+                      setNewExe(e.target.value);
+                      setNewPath((path) => pathAfterExecutableEdit(path, e.target.value));
+                      setIsHdrMatched(false);
+                    }}
                     className={`w-full px-3 py-2 text-xs border focus:outline-none font-mono ${
                       isDark
                         ? 'border-[#f55a6b]/30 bg-[#120d0e] focus:border-[#f55a6b] text-white'

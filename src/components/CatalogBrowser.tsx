@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { CatalogEntry, AppConfig, HdrApp, SupportTier } from '../types';
 import { invoke } from '@tauri-apps/api/core';
 import { configClient } from '../useConfig';
-import { findTrackedApp } from '../libraryState';
+import { captureLibraryRow, findTrackedApp } from '../libraryState';
 import { catalogNotes } from '../catalogNotes';
 import {
   Search,
@@ -70,9 +70,10 @@ export const CatalogBrowser: React.FC<CatalogBrowserProps> = ({
     }
   };
 
-  const handleRemoveGame = async (exeName: string) => {
+  const handleRemoveGame = async (app: HdrApp) => {
     try {
-      await configClient.mutate('remove_app', { exeName });
+      const { row, origin } = captureLibraryRow(configClient, config.apps, app);
+      await configClient.mutate('remove_app', { row }, origin);
     } catch (err) {
       configClient.reportError(err);
     }
@@ -189,6 +190,9 @@ export const CatalogBrowser: React.FC<CatalogBrowserProps> = ({
           </div>
           <p className={`text-xs mt-1 ${isDark ? 'text-[#8a7f81]' : 'text-slate-600'}`}>
             {t.catalogSubtitle}
+          </p>
+          <p className={`text-[10px] mt-1 ${isDark ? 'text-[#8a7f81]' : 'text-slate-600'}`}>
+            {t.appsHelperAliasCleanup}
           </p>
         </div>
 
@@ -316,7 +320,7 @@ export const CatalogBrowser: React.FC<CatalogBrowserProps> = ({
                       size="sm"
                       isDark={isDark}
                       icon={<Check className={`w-3.5 h-3.5 ${isDark ? 'text-emerald-400' : 'text-emerald-600'}`} />}
-                      onClick={() => handleRemoveGame(tracked.exe_name)}
+                      onClick={() => handleRemoveGame(tracked)}
                     />
                   ) : (
                     <GlitchButton

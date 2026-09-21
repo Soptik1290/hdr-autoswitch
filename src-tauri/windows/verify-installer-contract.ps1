@@ -36,6 +36,16 @@ Assert-Contract ($nsis.Contains('--hdr-installer-preflight nsis')) 'NSIS preflig
 Assert-Contract ($nsis.Contains('--hdr-installer-uninstall nsis')) 'NSIS uninstall ownership check is missing.'
 Assert-Contract ($nsis.Contains('SetErrorLevel 1')) 'Unattended NSIS failures must be explicit.'
 
+$uninstall = [regex]::Match($nsis, '(?ms)^Section "Uninstall"\r?\n(.*?)^SectionEnd').Groups[1].Value
+$prepare = $uninstall.IndexOf('--hdr-installer-retirement-prepare nsis')
+$payload = $uninstall.IndexOf('!insertmacro HdrDeleteUninstallPayload "$INSTDIR\uninstall.exe"')
+$retire = $uninstall.IndexOf('--hdr-installer-retirement-commit nsis')
+$cleanup = $uninstall.IndexOf('Rename "$HdrUninstallRecovery" "$PLUGINSDIR\hdr-uninstall-complete"')
+Assert-Contract ($prepare -ge 0 -and $payload -gt $prepare -and $retire -gt $payload -and $cleanup -gt $retire) 'Exact registry authority and recovery must survive payload deletion and checked retirement.'
+Assert-Contract ($uninstall -notmatch '\bDeleteReg(?:Key|Value)\b') 'NSIS must not bypass checked registry retirement with unchecked metadata commands.'
+Assert-Contract ($uninstall.Contains('--hdr-installer-retirement-restore nsis') -and $uninstall.Contains('Installation metadata recovery was NOT confirmed')) 'Denied registry rollback must retain a usable recovery helper with explicit instructions.'
+Assert-Contract ($module.Contains('fn retire_nsis_registration(') -and $module.Contains('fn restore_nsis_registration(') -and $module.Contains('verify_recovery_pair(target, recovery)?;')) 'Retirement and recovery require checked metadata and complete cleanup executables.'
+
 # A lock on only the old uninstaller must not allow the remaining install
 # section or success/launch callbacks to run. Require the error guard directly
 # after WriteUninstaller, before another instruction can clear its error flag.

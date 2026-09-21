@@ -36,6 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const SHUTDOWN_ATTEMPT_BUDGET: usize = 32;
 const FOREGROUND_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+const INVENTORY_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 const FOREGROUND_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -76,7 +77,89 @@ fn manual_admission(snapshot: &ConfigSnapshot, admitted: bool) -> ManualControl 
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ManualScopeResult {
+    pub revision: String,
+    pub scope: TargetMonitor,
+    pub request: ManualRequestIdentity,
+    pub verified: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManualRequestIdentity {
+    pub client_id: String,
+    pub sequence: String,
+}
+
+impl ManualRequestIdentity {
+    fn validate(&self) -> Result<u64, String> {
+        let sequence = self.sequence.parse::<u64>().map_err(|_| "Invalid manual request sequence")?;
+        if sequence == 0 || sequence.to_string() != self.sequence || self.client_id.is_empty()
+            || self.client_id.len() > 128
+            || !self.client_id.bytes().all(|c| c.is_ascii_alphanumeric() || b":-".contains(&c))
+        {
+            return Err("Invalid manual request identity".into());
+        }
+        Ok(sequence)
+    }
+}
+
+#[derive(Default)]
+struct ManualObservations {
+    revision: u64,
+    scopes: Vec<ManualScopeResult>,
+}
+
+impl ManualObservations {
+    fn begin(&mut self) -> Result<(), String> {
+        self.revision = self.revision.checked_add(1).ok_or("Manual HDR sequence exhausted")?;
+        Ok(())
+    }
+
+    fn admit(&self, scope: &TargetMonitor, request: &ManualRequestIdentity) -> Result<(), String> {
+        let sequence = request.validate()?;
+        if self.scopes.iter().any(|entry| same_target(&entry.scope, scope)
+            && entry.request.client_id == request.client_id
+            && entry.request.validate().is_ok_and(|completed| completed >= sequence))
+        {
+            return Err("This manual request was superseded or already completed. Retry the control.".into());
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, scope: TargetMonitor, request: ManualRequestIdentity, verified: bool, error: Option<String>) {
+        // Keep correlation proofs across origins, but current admission errors belong
+        // to the latest executed request for this scope, not each client's history.
+        for entry in self.scopes.iter_mut().filter(|entry| same_target(&entry.scope, &scope)) {
+            entry.error = None;
+        }
+        let observed = ManualScopeResult { revision: self.revision.to_string(), scope, request, verified, error };
+        if let Some(previous) = self.scopes.iter_mut().find(|entry| same_target(&entry.scope, &observed.scope)
+            && entry.request.client_id == observed.request.client_id)
+        {
+            *previous = observed;
+        } else {
+            self.scopes.push(observed);
+        }
+    }
+
+    fn append_errors(&self, warnings: &mut Vec<String>) {
+        for error in self.scopes.iter().filter_map(|entry| entry.error.as_ref()) {
+            if !warnings.contains(error) {
+                warnings.push(error.clone());
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct HdrStatePayload {
+    /// Decimal strings preserve ordering beyond JavaScript's integer precision.
+    pub status_revision: String,
+    pub inventory_revision: String,
+    pub manual_revision: String,
+    pub manual_results: Vec<ManualScopeResult>,
     /// Observed frozen activation scope, or the saved scope when no activation exists.
     pub is_hdr_active: bool,
     pub scope_hdr_state: ScopeHdrState,
@@ -102,6 +185,10 @@ pub struct HdrStatePayload {
 impl HdrStatePayload {
     fn unavailable(message: String) -> Self {
         Self {
+            status_revision: "0".into(),
+            inventory_revision: "0".into(),
+            manual_revision: "0".into(),
+            manual_results: Vec::new(),
             is_hdr_active: false,
             scope_hdr_state: ScopeHdrState::Unknown,
             manual_control: ManualControl::Blocked { reason: message.clone() },
@@ -126,16 +213,24 @@ impl HdrStatePayload {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ManualSetResult {
+    pub scope: TargetMonitor,
+    pub request: ManualRequestIdentity,
     pub outcomes: Vec<MonitorOutcome>,
     pub partial: bool,
     pub status: HdrStatePayload,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MonitorInventorySnapshot {
+    pub inventory_revision: String,
+    pub monitors: Vec<MonitorInfo>,
+}
+
 enum Command {
     ForegroundObserved,
     ConfigCommitted,
-    Refresh(Sender<Result<Vec<MonitorInfo>, String>>),
-    ManualSet(TargetMonitor, bool, Sender<Result<ManualSetResult, String>>),
+    Refresh(Sender<Result<MonitorInventorySnapshot, String>>),
+    ManualSet(TargetMonitor, bool, ManualRequestIdentity, Sender<Result<ManualSetResult, String>>),
     Status(Sender<Result<HdrStatePayload, String>>),
     GameExited {
         generation: u64,
@@ -336,7 +431,7 @@ impl MonitorService {
         Ok(PendingRequest { receiver: receive })
     }
 
-    pub fn refresh(&self) -> Result<PendingRequest<Vec<MonitorInfo>>, String> {
+    pub fn refresh(&self) -> Result<PendingRequest<MonitorInventorySnapshot>, String> {
         self.enqueue(Command::Refresh)
     }
 
@@ -344,10 +439,12 @@ impl MonitorService {
         &self,
         scope: TargetMonitor,
         enable: bool,
+        request: ManualRequestIdentity,
     ) -> Result<PendingRequest<ManualSetResult>, String> {
+        request.validate()?;
         manual_admission(&self.config.snapshot()?, self.events.admitted.load(Ordering::Acquire))
             .require()?;
-        self.enqueue(|reply| Command::ManualSet(scope, enable, reply))
+        self.enqueue(|reply| Command::ManualSet(scope, enable, request, reply))
     }
 
     pub fn status(&self) -> Result<PendingRequest<HdrStatePayload>, String> {
@@ -607,6 +704,35 @@ fn take_expired_debounce(debounce: &mut Option<Debounce>, now: Instant) -> Optio
     }
 }
 
+struct InventoryObservation {
+    deadline: Instant,
+}
+
+impl InventoryObservation {
+    fn new(now: Instant) -> Self {
+        Self { deadline: now + INVENTORY_WATCHDOG_INTERVAL }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.deadline <= now
+    }
+
+    fn refreshed(&mut self, finished: Instant) {
+        self.deadline = finished + INVENTORY_WATCHDOG_INTERVAL;
+    }
+}
+
+#[derive(Default)]
+struct ActivationPreparation {
+    warning: Option<String>,
+}
+
+impl ActivationPreparation {
+    fn observed(&mut self, result: Result<(), String>) {
+        self.warning = result.err();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ForegroundKey {
     pid: u32,
@@ -774,9 +900,21 @@ fn unmatched_action(eligible: bool, alive: bool, exit_only: bool, expired: bool)
 #[derive(Default)]
 struct StatusPublication {
     last: Option<HdrStatePayload>,
+    current: Option<HdrStatePayload>,
+    revision: u64,
 }
 
 impl StatusPublication {
+    fn observe(&mut self, mut payload: HdrStatePayload) -> HdrStatePayload {
+        payload.status_revision = self.revision.to_string();
+        if self.current.as_ref() != Some(&payload) {
+            self.revision += 1;
+            payload.status_revision = self.revision.to_string();
+            self.current = Some(payload.clone());
+        }
+        payload
+    }
+
     fn changed(&self, payload: &HdrStatePayload) -> bool {
         self.last.as_ref() != Some(payload)
     }
@@ -924,6 +1062,9 @@ struct Actor {
     watcher: Option<ProcessWatcher>,
     debounce: Option<Debounce>,
     foreground_observation: ForegroundObservation,
+    inventory_observation: InventoryObservation,
+    activation_preparation: ActivationPreparation,
+    manual_observations: ManualObservations,
     last_outcomes: Vec<MonitorOutcome>,
     publication: StatusPublication,
 }
@@ -939,6 +1080,9 @@ impl Actor {
             watcher: None,
             debounce: None,
             foreground_observation: ForegroundObservation::default(),
+            inventory_observation: InventoryObservation::new(Instant::now()),
+            activation_preparation: ActivationPreparation::default(),
+            manual_observations: ManualObservations::default(),
             last_outcomes: Vec::new(),
             publication: StatusPublication::default(),
         }
@@ -959,22 +1103,36 @@ impl Actor {
         }
     }
 
+    fn refresh_inventory(&mut self) -> Result<Vec<MonitorInfo>, String> {
+        let result = self.controller.refresh_inventory();
+        self.inventory_observation.refreshed(Instant::now());
+        result
+    }
+
     fn run(mut self, receiver: Receiver<Command>) {
         let mut watchdog_deadline = Instant::now() + FOREGROUND_WATCHDOG_INTERVAL;
         loop {
             let now = Instant::now();
             let expired = take_expired_debounce(&mut self.debounce, now);
             let watchdog_due = watchdog_deadline <= now;
-            if expired.is_some() || watchdog_due {
+            let inventory_due = self.inventory_observation.due(now);
+            if expired.is_some() || watchdog_due || inventory_due {
                 if self.events.admitted.load(Ordering::Acquire) {
                     if expired.is_some()
-                        || self.foreground_observation.needs_observation(
+                        || (watchdog_due && self.foreground_observation.needs_observation(
                             self.events.foreground_key(), now,
-                        )
+                        ))
                     {
                         let _ = self.observe(expired, true);
                         self.publish();
+                    } else if inventory_due {
+                        // Inventory can change without a foreground hint. This read-only probe
+                        // never retries automatic writes or replaces the activation's members.
+                        let _ = self.refresh_inventory();
+                        self.publish();
                     }
+                } else if inventory_due {
+                    self.inventory_observation.refreshed(Instant::now());
                 }
                 if watchdog_due {
                     // Schedule from completion rather than hot-looping to catch up after slow work.
@@ -983,7 +1141,8 @@ impl Actor {
                 continue;
             }
             let received = receiver.recv_timeout(actor_wait_timeout(
-                self.debounce, watchdog_deadline, Instant::now(),
+                self.debounce, watchdog_deadline.min(self.inventory_observation.deadline),
+                Instant::now(),
             ));
             let command = match received {
                 Ok(command) => command,
@@ -1010,12 +1169,9 @@ impl Actor {
                 }
                 Command::Refresh(reply) => {
                     let result = if self.events.admitted.load(Ordering::Acquire) {
-                        self.observe(None, true).and_then(|_| {
-                            if let Some(error) = self.controller.inventory_error() {
-                                Err(error.to_string())
-                            } else {
-                                Ok(self.controller.inventory().to_vec())
-                            }
+                        self.refresh_inventory().map(|monitors| MonitorInventorySnapshot {
+                            inventory_revision: self.controller.inventory_revision(),
+                            monitors,
                         })
                     } else {
                         Err("The HDR controller is shutting down".into())
@@ -1023,12 +1179,8 @@ impl Actor {
                     self.publish();
                     let _ = reply.send(result);
                 }
-                Command::ManualSet(scope, enable, reply) => {
-                    let result = if self.events.admitted.load(Ordering::Acquire) {
-                        self.manual_set(scope, enable)
-                    } else {
-                        Err("The HDR controller is shutting down".into())
-                    };
+                Command::ManualSet(scope, enable, request, reply) => {
+                    let result = self.manual_set(scope, enable, request);
                     self.publish();
                     let _ = reply.send(result);
                 }
@@ -1064,7 +1216,7 @@ impl Actor {
                     if self.events.admitted.load(Ordering::Acquire)
                         && self.controller.matches_activation(generation, process)
                     {
-                        self.controller.warn(message);
+                        self.activation_preparation.observed(Err(message));
                         self.finish_activation(usize::MAX);
                         self.publish();
                     }
@@ -1149,6 +1301,7 @@ impl Actor {
         if self.watcher.as_ref().is_some_and(|watcher| {
             watcher.generation == active.generation && watcher.process == active.process
         }) {
+            self.activation_preparation.observed(Ok(()));
             return Ok(());
         }
         let generation = active.generation;
@@ -1158,11 +1311,12 @@ impl Actor {
             generation,
             self.events.clone(),
         )?);
+        self.activation_preparation.observed(Ok(()));
         Ok(())
     }
 
     fn observe(&mut self, expired: Option<Debounce>, enable_automatic: bool) -> Result<(), String> {
-        let _ = self.controller.refresh_inventory();
+        let _ = self.refresh_inventory();
         let origin = match self.config.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1241,13 +1395,15 @@ impl Actor {
                         outcomes = skipped;
                         self.tracked = Some(process);
                     }
-                    Err(error) => self.controller.warn(error.message),
+                    Err(error) => self.activation_preparation.observed(Err(error.message)),
                 }
+            } else {
+                self.activation_preparation.observed(Ok(()));
             }
         }
         if self.controller.activation().is_some() {
             if let Err(error) = self.ensure_watcher() {
-                self.controller.warn(error);
+                self.activation_preparation.observed(Err(error));
                 self.finish_activation(usize::MAX);
             } else if enable_automatic {
                 let mut authority = self.authority(OperationKind::AutomaticEnable);
@@ -1255,7 +1411,7 @@ impl Actor {
                 if !outcomes.is_empty() {
                     self.last_outcomes = outcomes.clone();
                 }
-                let _ = self.controller.refresh_inventory();
+                let _ = self.refresh_inventory();
                 self.reconcile_gate();
                 if self.controller.activation().is_some()
                     && self
@@ -1304,7 +1460,7 @@ impl Actor {
             self.last_outcomes = outcomes.clone();
         }
         self.tracked = None;
-        let _ = self.controller.refresh_inventory();
+        let _ = self.refresh_inventory();
         self.notify_verified(&outcomes, false);
     }
 
@@ -1312,62 +1468,78 @@ impl Actor {
         &mut self,
         scope: TargetMonitor,
         enable: bool,
+        request: ManualRequestIdentity,
     ) -> Result<ManualSetResult, String> {
+        self.manual_observations.admit(&scope, &request)?;
+        self.manual_observations.begin()?;
+        let result = self.execute_manual_set(&scope, enable);
+        let verified = result.as_ref().is_ok_and(|(outcomes, _)| {
+            !outcomes.is_empty() && outcomes.iter().all(MonitorOutcome::is_verified)
+        });
+        let error = match &result {
+            Err(error) => Some(error.clone()),
+            Ok((outcomes, _)) if outcomes.is_empty() => Some("No display result was returned.".into()),
+            Ok(_) => None,
+        };
+        self.manual_observations.finish(scope.clone(), request.clone(), verified, error);
+        result.map(|(outcomes, snapshot)| ManualSetResult {
+            scope, request, outcomes, partial: !verified, status: self.payload(&snapshot),
+        })
+    }
+
+    fn execute_manual_set(
+        &mut self,
+        scope: &TargetMonitor,
+        enable: bool,
+    ) -> Result<(Vec<MonitorOutcome>, ConfigSnapshot), String> {
         let snapshot = self.config.snapshot()?;
         manual_admission(&snapshot, self.events.admitted.load(Ordering::Acquire)).require()?;
         // Establish the logical interval without enabling HDR first. A manual Off while a game is
         // foreground must not produce an automatic On followed by a second hidden setter.
-        let _ = self.controller.refresh_inventory();
-        if let Ok(Some(process)) = observe_foreground() {
-            if automatic_pause_for_path(&snapshot, Some(&process.path), &process.exe, &snapshot.context_token).is_none() {
-                if self.controller.activation().is_none() {
-                    match self.controller.begin(
-                        process.identity,
-                        process.exe.clone(),
-                        snapshot.context_token.clone(),
-                        snapshot.settings.target_monitor.clone(),
-                    ) {
-                        Ok(_) => self.tracked = Some(process),
-                        Err(error) => self.controller.warn(error.message),
-                    }
-                } else if self
-                    .controller
-                    .activation()
-                    .is_some_and(|active| active.context_token == snapshot.context_token)
-                {
-                    self.controller
-                        .transfer(process.identity, process.exe.clone());
-                    self.tracked = Some(process);
-                    self.debounce = None;
-                }
-                if let Err(error) = self.ensure_watcher() {
-                    self.controller.warn(error);
-                }
-            }
+        let _ = self.refresh_inventory();
+        if let Ok(process) = observe_foreground() {
+            let preparation = self.prepare_manual_activation(&snapshot, process);
+            self.activation_preparation.observed(preparation);
         }
         let mut authority = self.authority(OperationKind::Manual);
-        let outcomes = self.controller.manual_set(&scope, enable, &mut authority);
+        let outcomes = self.controller.manual_set(scope, enable, &mut authority);
         self.last_outcomes = outcomes.clone();
-        for outcome in &outcomes {
-            if outcome.outcome == OutcomeKind::Failed {
-                if let Some(message) = &outcome.message {
-                    self.controller
-                        .warn(format!("The last manual HDR request failed: {message}"));
-                }
-            }
-        }
-        let _ = self.controller.refresh_inventory();
+        let _ = self.refresh_inventory();
         self.reconcile_gate();
         let snapshot = self.config.snapshot()?;
         let partial = outcomes.is_empty() || outcomes.iter().any(|outcome| !outcome.is_verified());
         if !partial {
             self.notify_verified(&outcomes, enable);
         }
-        Ok(ManualSetResult {
-            outcomes,
-            partial,
-            status: self.payload(&snapshot),
-        })
+        Ok((outcomes, snapshot))
+    }
+
+    fn prepare_manual_activation(
+        &mut self,
+        snapshot: &ConfigSnapshot,
+        process: Option<TrackedProcess>,
+    ) -> Result<(), String> {
+        if let Some(process) = process.filter(|process| automatic_pause_for_path(
+            snapshot, Some(&process.path), &process.exe, &snapshot.context_token,
+        ).is_none()) {
+            if self.controller.activation().is_none() {
+                self.controller.begin(
+                    process.identity,
+                    process.exe.clone(),
+                    snapshot.context_token.clone(),
+                    snapshot.settings.target_monitor.clone(),
+                ).map_err(|error| error.message)?;
+                self.tracked = Some(process);
+            } else if self.controller.activation()
+                .is_some_and(|active| active.context_token == snapshot.context_token)
+            {
+                self.controller.transfer(process.identity, process.exe.clone());
+                self.tracked = Some(process);
+                self.debounce = None;
+            }
+        }
+        // A retained exit-only activation still needs its watcher when focus leaves the game.
+        self.ensure_watcher()
     }
 
     fn notify_verified(&self, outcomes: &[MonitorOutcome], enabled: bool) {
@@ -1399,7 +1571,7 @@ impl Actor {
             .show();
     }
 
-    fn payload(&self, snapshot: &ConfigSnapshot) -> HdrStatePayload {
+    fn payload(&mut self, snapshot: &ConfigSnapshot) -> HdrStatePayload {
         let active = self.controller.activation();
         let app = active.and_then(|active| {
             snapshot.settings.resolve_app(
@@ -1407,6 +1579,7 @@ impl Actor {
             ).matched()
         });
         let mut warnings = self.foreground_observation.warnings(self.controller.warning());
+        warnings.extend(self.activation_preparation.warning.clone());
         if let Some(issue) = &snapshot.issue {
             warnings.push(issue.clone());
         }
@@ -1447,7 +1620,12 @@ impl Actor {
         let scope_hdr_state = observed_scope
             .map(|scope| self.controller.scope_hdr_state(scope))
             .unwrap_or(ScopeHdrState::Unknown);
-        HdrStatePayload {
+        self.manual_observations.append_errors(&mut warnings);
+        let payload = HdrStatePayload {
+            status_revision: "0".into(),
+            inventory_revision: self.controller.inventory_revision(),
+            manual_revision: self.manual_observations.revision.to_string(),
+            manual_results: self.manual_observations.scopes.clone(),
             is_hdr_active: scope_hdr_state == ScopeHdrState::Hdr,
             scope_hdr_state,
             manual_control: manual_admission(snapshot, self.events.admitted.load(Ordering::Acquire)),
@@ -1478,7 +1656,8 @@ impl Actor {
             inventory_stale: self.controller.inventory_error().is_some(),
             uncertain_targets: self.controller.uncertain_targets(),
             operation_outcomes: self.last_outcomes.clone(),
-        }
+        };
+        self.publication.observe(payload)
     }
 
     fn publish(&mut self) {
@@ -1486,8 +1665,14 @@ impl Actor {
             Ok(snapshot) => self.payload(&snapshot),
             Err(error) => {
                 let mut warnings = self.foreground_observation.warnings(self.controller.warning());
+                warnings.extend(self.activation_preparation.warning.clone());
                 warnings.push(error);
-                HdrStatePayload::unavailable(warnings.join("\n"))
+                self.manual_observations.append_errors(&mut warnings);
+                let mut payload = HdrStatePayload::unavailable(warnings.join("\n"));
+                payload.inventory_revision = self.controller.inventory_revision();
+                payload.manual_revision = self.manual_observations.revision.to_string();
+                payload.manual_results = self.manual_observations.scopes.clone();
+                self.publication.observe(payload)
             }
         };
         if !self.publication.changed(&payload) {
@@ -1511,6 +1696,14 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_request() -> ManualRequestIdentity {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        ManualRequestIdentity {
+            client_id: "gui:test".into(),
+            sequence: NEXT.fetch_add(1, Ordering::Relaxed).to_string(),
+        }
+    }
     use crate::config::HdrType;
     use crate::display::{NativeApi, RuntimeAddress};
 
@@ -1695,15 +1888,15 @@ mod tests {
             let fixture = manual_fixture(mode);
             let (service, receiver) = idle_service(fixture.manager.clone());
             if mode == ConfigMode::Unavailable {
-                assert!(service.manual_set(TargetMonitor::All, true).is_err());
+                assert!(service.manual_set(TargetMonitor::All, true, test_request()).is_err());
                 let mut authority = fixture.authority(OperationKind::Manual);
                 assert!(authority.authorize(&mock_attempt(), &mut || panic!("issued")).is_err());
             } else {
                 fixture.manager.set_controller_issue(Some("controller conflict".into())).unwrap();
-                assert!(service.manual_set(TargetMonitor::All, true).is_err());
+                assert!(service.manual_set(TargetMonitor::All, true, test_request()).is_err());
                 fixture.manager.set_controller_issue(None).unwrap();
                 service.events.admitted.store(false, Ordering::Release);
-                assert!(service.manual_set(TargetMonitor::All, false).is_err());
+                assert!(service.manual_set(TargetMonitor::All, false, test_request()).is_err());
             }
             assert!(receiver.try_recv().is_err());
         }
@@ -1743,7 +1936,7 @@ mod tests {
             ] {
                 for enabled in [true, false] {
                     assert_eq!(
-                        service.manual_set(scope.clone(), enabled).err().as_deref(),
+                        service.manual_set(scope.clone(), enabled, test_request()).err().as_deref(),
                         Some(crate::SAFE_TEST_ISSUE)
                     );
                 }
@@ -1771,14 +1964,17 @@ mod tests {
     fn manual_requests_enqueue_in_click_order_without_waiting_for_the_actor() {
         let fixture = GateFixture::new();
         let (service, receiver) = idle_service(fixture.manager.clone());
-        let on = service.manual_set(TargetMonitor::All, true).unwrap();
-        let off = service.manual_set(TargetMonitor::All, false).unwrap();
-        for (expected, result) in [(true, "first result"), (false, "second result")] {
-            let Command::ManualSet(scope, enabled, reply) = receiver.try_recv().unwrap() else {
+        let gui = test_request();
+        let tray = ManualRequestIdentity { client_id: "tray".into(), sequence: "1".into() };
+        let on = service.manual_set(TargetMonitor::All, true, gui.clone()).unwrap();
+        let off = service.manual_set(TargetMonitor::All, false, tray.clone()).unwrap();
+        for (expected, identity, result) in [(true, gui, "first result"), (false, tray, "second result")] {
+            let Command::ManualSet(scope, enabled, request, reply) = receiver.try_recv().unwrap() else {
                 panic!("Expected manual request");
             };
             assert_eq!(scope, TargetMonitor::All);
             assert_eq!(enabled, expected);
+            assert_eq!(request, identity, "admission must preserve the caller's correlation identity");
             reply.send(Err(result.into())).unwrap();
         }
         // Awaiting in the opposite order cannot change the already-enqueued native order.
@@ -1791,11 +1987,11 @@ mod tests {
     fn manual_waiter_reports_a_dropped_actor_response_without_hanging() {
         let fixture = GateFixture::new();
         let (service, receiver) = idle_service(fixture.manager.clone());
-        let pending = service.manual_set(TargetMonitor::All, false).unwrap();
+        let pending = service.manual_set(TargetMonitor::All, false, test_request()).unwrap();
         drop(receiver);
         assert!(tauri::async_runtime::block_on(pending.resolve())
             .unwrap_err().contains("stopped before responding"));
-        assert!(service.manual_set(TargetMonitor::All, true).is_err());
+        assert!(service.manual_set(TargetMonitor::All, true, test_request()).is_err());
     }
 
     #[test]
@@ -1805,13 +2001,13 @@ mod tests {
         for conflict in [true, false] {
             let fixture = GateFixture::new();
             let (service, receiver) = idle_service(fixture.manager.clone());
-            let pending = service.manual_set(TargetMonitor::All, true).unwrap();
+            let pending = service.manual_set(TargetMonitor::All, true, test_request()).unwrap();
             if conflict {
                 fixture.manager.set_controller_issue(Some("new conflict".into())).unwrap();
             } else {
                 service.events.admitted.store(false, Ordering::Release);
             }
-            let Command::ManualSet(scope, enabled, reply) = receiver.try_recv().unwrap() else {
+            let Command::ManualSet(scope, enabled, _, reply) = receiver.try_recv().unwrap() else {
                 panic!("Expected queued manual request");
             };
             let mut authority = fixture.authority(OperationKind::Manual);
@@ -2036,9 +2232,9 @@ mod tests {
             assert_eq!(latest.settings.resolve_app(None, "BsSndRpt64.exe"), Resolution::Excluded);
             let mut payload = HdrStatePayload::unavailable("test display unavailable".into());
             payload.quarantined_apps = quarantined_apps(&latest.settings);
-            assert_eq!(payload.quarantined_apps, [QuarantinedApp {
-                name: "My Age of Empires IV".into(), exe_name: "BsSndRpt64.exe".into(),
-            }]);
+            assert_eq!(payload.quarantined_apps.len(), 1);
+            assert_eq!(payload.quarantined_apps[0].name, "My Age of Empires IV");
+            assert_eq!(payload.quarantined_apps[0].exe_name, "BsSndRpt64.exe");
             if publication.changed(&payload) {
                 publications += 1;
                 publication.published(payload);
@@ -2051,9 +2247,10 @@ mod tests {
 
         let invalid = fixture.manager.mutate(
             &before.context_token, Some(&before.library_generation), true,
-            |settings| crate::library::repair_executable(
-                settings, "BsSndRpt64.exe", "GameLaunchHelper.exe", r"D:\AOE4\GameLaunchHelper.exe",
-            ),
+            |settings| {
+                let row = crate::library::AppRowIdentity::at(settings, 0)?;
+                crate::library::repair_executable(settings, &row, "GameLaunchHelper.exe", r"D:\AOE4\GameLaunchHelper.exe")
+            },
         );
         assert!(invalid.is_err());
         assert_eq!(fixture.manager.snapshot().unwrap(), before);
@@ -2062,9 +2259,10 @@ mod tests {
         // A fixture-selected executable, not a claim about AOE4's real binary.
         let repaired = fixture.manager.mutate(
             &before.context_token, Some(&before.library_generation), true,
-            |settings| crate::library::repair_executable(
-                settings, "BsSndRpt64.exe", "user-selected.exe", r"D:\AOE4\user-selected.exe",
-            ),
+            |settings| {
+                let row = crate::library::AppRowIdentity::at(settings, 0)?;
+                crate::library::repair_executable(settings, &row, "user-selected.exe", r"D:\AOE4\user-selected.exe")
+            },
         ).unwrap();
         let mut expected = before.settings.apps[0].clone();
         expected.exe_name = "user-selected.exe".into();
@@ -2222,6 +2420,207 @@ mod tests {
         let serialized = serde_json::to_value(payload).unwrap();
         assert_eq!(serialized["scope_hdr_state"], "unknown");
         assert_eq!(serialized["is_hdr_active"], false);
+    }
+
+    #[test]
+    fn correlation_proofs_survive_later_cross_origin_results_without_retaining_old_condition_errors() {
+        let mut observations = ManualObservations::default();
+        let gui = ManualRequestIdentity { client_id: "gui:window".into(), sequence: "2".into() };
+        let tray = ManualRequestIdentity { client_id: "tray".into(), sequence: "1".into() };
+        observations.admit(&TargetMonitor::All, &gui).unwrap();
+        observations.begin().unwrap();
+        observations.finish(TargetMonitor::All, gui.clone(), false, Some("Old GUI admission failure".into()));
+        observations.admit(&TargetMonitor::All, &tray).unwrap();
+        observations.begin().unwrap();
+        observations.finish(TargetMonitor::All, tray.clone(), true, None);
+        assert_eq!(observations.scopes.len(), 2);
+        assert_eq!(observations.scopes[0].request, gui);
+        assert_eq!(observations.scopes[1].request, tray);
+        let mut warnings = vec!["Unresolved controller conflict".into()];
+        observations.append_errors(&mut warnings);
+        assert_eq!(warnings, ["Unresolved controller conflict"]);
+        let serialized = serde_json::to_value(&observations.scopes).unwrap();
+        assert_eq!(serialized[0]["request"]["client_id"], "gui:window");
+        assert_eq!(serialized[0]["request"]["sequence"], "2");
+    }
+
+    #[test]
+    fn correlation_rejects_duplicate_or_reordered_same_client_commands_before_another_operation() {
+        let mut observations = ManualObservations::default();
+        let request = |sequence: &str| ManualRequestIdentity { client_id: "gui:window".into(), sequence: sequence.into() };
+        observations.admit(&TargetMonitor::All, &request("2")).unwrap();
+        observations.begin().unwrap();
+        observations.finish(TargetMonitor::All, request("2"), true, None);
+        for sequence in ["1", "2"] {
+            assert!(observations.admit(&TargetMonitor::All, &request(sequence)).is_err());
+        }
+        assert_eq!(observations.revision, 1);
+        observations.admit(&TargetMonitor::All, &request("3")).unwrap();
+        observations.admit(&TargetMonitor::Monitor {
+            device_path: "another".into(), display_name: "Another".into(),
+        }, &request("1")).unwrap();
+    }
+
+    #[test]
+    fn correlation_rejects_malformed_identifiers_before_queue_admission() {
+        let fixture = GateFixture::new();
+        let (service, receiver) = idle_service(fixture.manager.clone());
+        for (client_id, sequence) in [
+            ("", "1"), ("gui:bad\nid", "1"), ("gui:test", "0"), ("gui:test", "01"),
+            ("gui:test", "-1"), ("gui:test", "18446744073709551616"),
+        ] {
+            assert!(service.manual_set(TargetMonitor::All, true, ManualRequestIdentity {
+                client_id: client_id.into(), sequence: sequence.into(),
+            }).is_err());
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn review_manual_observations_order_both_origins_and_keep_scope_recovery_proofs() {
+        let mut observations = ManualObservations::default();
+        let other = TargetMonitor::Monitor { device_path: "other".into(), display_name: "Other".into() };
+        observations.begin().unwrap();
+        observations.finish(TargetMonitor::All, test_request(), false, Some("All request refused".into()));
+        let failed_all = observations.scopes.clone();
+        observations.begin().unwrap();
+        observations.finish(other.clone(), test_request(), true, None);
+        let mut warnings = vec!["Unresolved controller conflict".into()];
+        observations.append_errors(&mut warnings);
+        assert_eq!(warnings, ["Unresolved controller conflict", "All request refused"]);
+        assert_eq!(observations.scopes[0], failed_all[0]);
+        observations.begin().unwrap();
+        observations.finish(TargetMonitor::All, test_request(), true, None);
+        assert_eq!(observations.scopes.len(), 2);
+        assert_eq!(observations.scopes[0].revision, "3");
+        assert!(observations.scopes[0].verified);
+        assert_eq!(observations.scopes[1].revision, "2");
+        let mut current = vec!["Unresolved controller conflict".into()];
+        observations.append_errors(&mut current);
+        assert_eq!(current, ["Unresolved controller conflict"]);
+        observations.begin().unwrap();
+        observations.finish(other, test_request(), false, Some("Newer Other failure".into()));
+        assert_eq!(observations.scopes[0].revision, "3", "full snapshots retain missed recovery proofs");
+        assert_eq!(observations.scopes[1].revision, "4");
+        assert!(!observations.scopes[1].verified);
+        assert_eq!(failed_all[0].error.as_deref(), Some("All request refused"), "old replies are immutable");
+    }
+
+    #[test]
+    fn review_manual_scope_revisions_use_identity_and_do_not_duplicate_warning_messages() {
+        let mut observations = ManualObservations::default();
+        for (path, name) in [("Chosen", "Display"), ("CHOSEN", "Renamed")] {
+            observations.begin().unwrap();
+            observations.finish(TargetMonitor::Monitor {
+                device_path: path.into(), display_name: name.into(),
+            }, test_request(), false, Some("Request refused".into()));
+        }
+        assert_eq!(observations.scopes.len(), 1);
+        assert_eq!(observations.scopes[0].revision, "2");
+        let mut warnings = vec!["Request refused".into()];
+        observations.append_errors(&mut warnings);
+        assert_eq!(warnings, ["Request refused"]);
+        let mut payload = HdrStatePayload::unavailable("Read failed".into());
+        payload.manual_revision = observations.revision.to_string();
+        payload.manual_results = observations.scopes.clone();
+        let serialized = serde_json::to_value(payload).unwrap();
+        assert_eq!(serialized["manual_revision"], "2");
+        assert_eq!(serialized["manual_results"][0]["revision"], "2");
+        assert_eq!(serialized["manual_results"][0]["scope"]["device_path"], "CHOSEN");
+        observations.revision = u64::MAX;
+        assert!(observations.begin().is_err(), "exhausted ordering must not admit another native operation");
+    }
+
+    #[test]
+    fn status_exposes_inventory_and_status_versions_as_decimal_strings() {
+        let serialized = serde_json::to_value(
+            HdrStatePayload::unavailable("Read failed".into()),
+        ).unwrap();
+        assert_eq!(serialized["inventory_revision"], "0");
+        assert_eq!(serialized["status_revision"], "0");
+    }
+
+    #[test]
+    fn inventory_changes_publish_with_unchanged_aggregate_and_identical_polls_stay_quiet() {
+        let mut publication = StatusPublication::default();
+        let mut payload = HdrStatePayload::unavailable("unchanged automatic policy".into());
+        payload.inventory_revision = "1".into();
+        let first = publication.observe(payload.clone());
+        assert_eq!(first.status_revision, "1");
+        publication.published(first.clone());
+        let repeated = publication.observe(payload.clone());
+        assert!(!publication.changed(&repeated));
+
+        payload.inventory_revision = "2".into();
+        let connected = publication.observe(payload.clone());
+        assert_eq!(connected.scope_hdr_state, first.scope_hdr_state);
+        assert_eq!(connected.any_hdr_active, first.any_hdr_active);
+        assert_eq!(connected.status_revision, "2");
+        assert!(publication.changed(&connected));
+        publication.published(connected);
+        for _ in 0..100 {
+            let repeated = publication.observe(payload.clone());
+            assert_eq!(repeated.status_revision, "2");
+            assert!(!publication.changed(&repeated));
+        }
+    }
+
+    #[test]
+    fn manual_warning_recovery_has_a_new_status_revision_without_inventory_changes() {
+        let mut publication = StatusPublication::default();
+        let mut payload = HdrStatePayload::unavailable("The last manual HDR request failed".into());
+        payload.inventory_revision = "7".into();
+        let failed = publication.observe(payload.clone());
+        publication.published(failed.clone());
+        payload.warning = None;
+        let recovered = publication.observe(payload);
+        assert_eq!(recovered.inventory_revision, failed.inventory_revision);
+        assert_ne!(recovered.status_revision, failed.status_revision);
+        assert!(publication.changed(&recovered));
+        publication.published(recovered.clone());
+        assert!(!publication.changed(&recovered));
+    }
+
+    #[test]
+    fn manual_native_success_does_not_clear_unresolved_preparation_but_verified_retry_does() {
+        use crate::display::tests::{monitor, MockDisplay};
+
+        struct NoWrite;
+        impl WriteAuthority for NoWrite {
+            fn authorize(
+                &mut self, _: &NativeAttempt, _: &mut dyn FnMut(),
+            ) -> Result<(), DisplayFailure> {
+                panic!("an already-satisfied mock observation must not issue a native write");
+            }
+        }
+        let mut controller = HdrController::new(MockDisplay::new(vec![monitor("chosen", 1, false)]));
+        controller.warn("Unresolved controller conflict");
+        for failure in ["Activation target unavailable", "Process watcher unavailable"] {
+            let mut preparation = ActivationPreparation::default();
+            preparation.observed(Err(failure.into()));
+            let mut publication = StatusPublication::default();
+            let mut failed = HdrStatePayload::unavailable(failure.into());
+            failed.inventory_revision = "1".into();
+            let failed = publication.observe(failed);
+            publication.published(failed.clone());
+
+            // A native state verification alone does not prove automatic setup recovered.
+            let manual = controller.manual_set(
+                &TargetMonitor::All, false, &mut NoWrite,
+            );
+            assert!(manual[0].is_verified());
+            assert_eq!(preparation.warning.as_deref(), Some(failure));
+            // The actor records this only after successful begin/watch setup, or a verified
+            // observation that automatic setup is not required for the foreground process.
+            preparation.observed(Ok(()));
+            assert!(preparation.warning.is_none());
+            assert_eq!(controller.warning().as_deref(), Some("Unresolved controller conflict"));
+            let mut recovered = failed.clone();
+            recovered.warning = controller.warning();
+            let recovered = publication.observe(recovered);
+            assert!(publication.changed(&recovered));
+            assert_ne!(recovered.status_revision, failed.status_revision);
+        }
     }
 
     #[test]
@@ -2434,6 +2833,67 @@ mod tests {
         }
         let same_process_new_hint = ForegroundKey { generation: 2, ..key };
         assert!(!observation.needs_observation(same_process_new_hint, now));
+    }
+
+    #[test]
+    fn inventory_watchdog_skips_four_idle_ticks_and_deduplicates_unchanged_observations() {
+        use crate::display::tests::{monitor, MockDisplay};
+
+        let now = Instant::now();
+        let mut schedule = InventoryObservation::new(now);
+        let mut controller = HdrController::new(MockDisplay::new(vec![monitor("chosen", 1, false)]));
+        controller.refresh_inventory().unwrap();
+        schedule.refreshed(now);
+        let mut publication = StatusPublication::default();
+        let mut payload = HdrStatePayload::unavailable("unchanged policy".into());
+        payload.inventory_revision = controller.inventory_revision();
+        let first = publication.observe(payload.clone());
+        publication.published(first);
+        let mut probes = 0;
+        for tick in 1..=60 {
+            let at = now + FOREGROUND_WATCHDOG_INTERVAL * tick;
+            assert_eq!(schedule.due(at), tick % 5 == 0);
+            if schedule.due(at) {
+                controller.refresh_inventory().unwrap();
+                schedule.refreshed(at);
+                probes += 1;
+                payload.inventory_revision = controller.inventory_revision();
+                let observed = publication.observe(payload.clone());
+                assert!(!publication.changed(&observed));
+            }
+        }
+        assert_eq!(probes, 12, "the one-second foreground watchdog must not query inventory");
+    }
+
+    #[test]
+    fn event_refreshes_rearm_inventory_deadline_from_completion_without_catch_up() {
+        let now = Instant::now();
+        let mut schedule = InventoryObservation::new(now);
+        assert!(!schedule.due(now + Duration::from_secs(4)));
+        // Foreground/config/manual/explicit refreshes all reset the independent probe.
+        schedule.refreshed(now + Duration::from_secs(4));
+        assert!(!schedule.due(now + Duration::from_secs(5)));
+        assert!(!schedule.due(now + Duration::from_secs(8)));
+        assert!(schedule.due(now + Duration::from_secs(9)));
+        // A slow successful or failed query receives a complete quiet interval afterwards.
+        schedule.refreshed(now + Duration::from_secs(20));
+        for tick in 20..25 {
+            assert!(!schedule.due(now + Duration::from_secs(tick)));
+        }
+        assert!(schedule.due(now + Duration::from_secs(25)));
+    }
+
+    #[test]
+    fn independent_inventory_deadline_wakes_between_foreground_watchdog_ticks() {
+        let now = Instant::now();
+        let mut schedule = InventoryObservation::new(now);
+        schedule.refreshed(now + Duration::from_millis(4500));
+        let at = now + Duration::from_secs(9);
+        let foreground = now + Duration::from_secs(10);
+        assert_eq!(
+            actor_wait_timeout(None, foreground.min(schedule.deadline), at),
+            Duration::from_millis(500),
+        );
     }
 
     #[test]

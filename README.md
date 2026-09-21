@@ -45,8 +45,8 @@ always recheck current authorization, including after a delayed observation.
 * **Deep Multi-Drive Discovery**: Automatically scans all connected storage drives (`C:`, `D:`, `E:`, etc.) via Steam's `libraryfolders.vdf` and `appmanifest_*.acf` manifests, Epic Games Launcher manifests (`%ProgramData%\Epic`), GOG Galaxy, and Windows Registry.
 * **Provider-specific Executable Support**: Automatic selection requires a provider-authorized executable that exists locally. Finding an `.exe` recursively, matching a title, or knowing a Steam AppID alone is not executable authority. Unsupported or conflicting evidence remains unresolved rather than guessed.
 * **Categorized & Pre-Selected Results**:
-  - **HDR Supported Games (Top)**: Verified HDR titles are grouped at the top and pre-selected (`[x]`) by default.
-  - **SDR Installed Games (Bottom)**: Other installed games are listed in a separate section below (`[ ]` un-checked by default), allowing you to enable tracking for RTX HDR or community mods with one click.
+  - **HDR Supported Games (Top)**: Verified HDR titles stay in this group regardless of selection. Automatic game detection controls initial selection, not the support classification.
+  - **Other Installed Games (Bottom)**: Games with unverified HDR support are unselected by default; this is not a claim that they are SDR-only. You can explicitly select them for RTX HDR or community mods.
 * **Smart Library State Badges**:
   - `★ NEW`: Newly discovered HDR games ready to be added.
   - `✓ IN LIBRARY`: Previously tracked games that are already up to date.
@@ -55,6 +55,7 @@ always recheck current authorization, including after a delayed observation.
 ### 📂 3. Native File Picker ("Browse...") & Drag & Drop
 * **Native Windows File Picker**: Click **"Browse... / Procházet..."** in the Manual Add modal to select any `.exe` using the standard Windows 64-bit file dialog.
 * **Global Drag & Drop**: Drag any `.exe` file from Windows Explorer directly into the application window. The app automatically inspects the binary, queries the database, and pre-fills the title and HDR support tier.
+* Editing the primary executable after browsing clears an incompatible picked path. Add, import, update, and repair also validate primary/path consistency in the backend.
 
 ### 🛡️ 4. Flexible HDR Deactivation Policies
 * **Only when game exits (Recommended)**: Keeps HDR active during Alt+Tab (e.g. checking Discord, Spotify, or a walkthrough in your browser). Completely eliminates monitor renegotiation blackouts, signal delay, and DirectX swapchain desync. Switches back to SDR immediately when the game closes.
@@ -68,7 +69,7 @@ always recheck current authorization, including after a delayed observation.
 
 ### 💽 6. Drive Migration & Disk Path Verification
 * Real-time path checking detects if an executable has been moved across drives or uninstalled, marking it with a `[FILE NOT FOUND]` badge and prompting you to run the scanner to refresh the location.
-* Importing moved games automatically updates paths, launchers, and Steam IDs without creating duplicates.
+* Explicitly importing a moved game updates its path and available launcher metadata. Conflicting installations or ambiguous library owners require selection or repair rather than silently choosing a row.
 
 ### 🖥️ 7. Native Win32 DisplayConfig API & Per-Monitor Targeting
 * Interacts directly with GPU display drivers via native Windows `QueryDisplayConfig` / `SetDisplayConfig` APIs.
@@ -108,12 +109,20 @@ Download the latest installer (`.exe` setup or `.msi`) from the [**Releases Page
 * **Provider Authority**: Executable support is **provider-specific**, **not a universal storefront mapping**. Only embedded executable authority can authorize automatic matching or canonical row enrichment.
 * **Xbox Games**: Discovery covers accessible local `XboxGames` via bounded `MicrosoftGame.config` parsing without probing protected packages. Competing files stay **unresolved rather than guessed**. The verified AOE3 Xbox binding selects `AoE3DE.exe` (**not a claim of live AOE3 HDR verification**).
 * **Crash Reporter Quarantine**: Known shared helpers or crash utilities (`GameLaunchHelper.exe`, `BsSndRpt.exe`, `BugSplat.exe`, etc.) are **quarantined at runtime** with status alerts, allowing one-click repair that **preserves other choices**.
+* **Inconsistent Legacy Bindings**: A saved primary whose filename does not match its path is also quarantined, including its historical aliases. The derived warning identifies the affected row without rewriting saved data. Repair discards historical aliases, preserves other preferences, and rejects collisions with enabled or disabled owners.
+* **Legacy Helper Aliases**: A healthy primary may retain old helper aliases, which never authorize runtime matching. Confirmed add/import updates remove only exact permanently excluded helper aliases while preserving other aliases and the existing explicit-update metadata/enablement policy. Incoming helpers still fail validation; background enrichment never silently removes saved aliases.
 * **Precise Path Matching**: Runtime matching prioritizes exact normalized paths to prevent spoofing or misattribution between different game editions.
+* **Row-Scoped Commands**: Toggle, delete, and repair use a snapshot-local index plus primary/path identity and a library-generation fence. Add/import updates require a unique path-aware owner. Even identical legacy duplicate rows can be removed individually; no persisted row-ID migration is needed. Rejected actions leave config bytes and revision/generation unchanged.
+* **Catalog Identity & Synchronization**: Explicit embedded name aliases canonicalize proven equivalent products (including Dead Space and Resident Evil remake names and Baldur's Gate 3's DX11 label). Distinct products sharing a basename remain ambiguous. Sync and reload share one merge policy: only support tier and notes overlay embedded records; executable, type, product, and storefront authority remain authored. Serialized, flushed atomic cache publication prevents partial writes and stale startup/manual sync results from becoming current.
 
 #### Display Control & Cleanup
 * **Native Switching**: Direct per-display Win32 HDR switching without sending simulated hotkeys.
 * **Safe Cleanup**: Automatic restoration only reverts HDR changes that were verified to be initiated by the application, leaving existing user HDR states intact.
-* **Reliable Uninstallation**: Clean rollback and staging protection ensure no orphaned processes or corrupted autostart entries.
+* **Inventory Revisions**: Display inventory and status carry monotonic revisions, including name, capability, connection, and known-state changes that leave aggregate HDR unchanged. An idle read-only probe runs at most every five seconds, independently of the cheap one-second foreground watchdog. Identical observations remain quiet; stale frontend replies cannot replace newer observations.
+* **Current Manual Warnings**: A verified scoped recovery retires the corresponding manual-failure warning, not unresolved uncertainty, other displays' failures, or controller conflicts.
+* **Cross-Origin Manual Ordering**: GUI and tray results share actor-issued manual revisions, while every request also carries an ephemeral client identity and monotonic client sequence. Actor admission echoes this identity and refuses duplicate/older requests from the same client and scope. Snapshots preserve each client's latest per-scope completion proof. A submission/transport failure is retired only by a matching result or a later same-client, same-scope completed retry, never by an actor revision that might describe an older missed request. Unknown GUI delivery failures therefore remain visible after unrelated tray results; retry from the original control to reconcile them. Native conditions still follow actor status ordering, so late replies cannot hide newer failures, controller conflicts, or uncertainty. No request identity is persisted in settings.
+* **Process Ownership**: Native process handles are immediately RAII-owned, including failed queries and duplicate windows. Process listings distinguish same-basename installations by normalized full path.
+* **Recoverable Uninstallation**: Payload deletion and owned registry retirement are checked. Registry deletion/readback failures are explicit failures; verified cleanup executables and transaction evidence remain available for recovery instead of leaving uninstall registration pointing to missing files.
 
 </details>
 
@@ -176,7 +185,7 @@ labels, and file-picker titles follow the selected language; game names and
 unknown external catalog descriptions are preserved. Native diagnostic details
 retain their backend or Windows language.
 
-Run the isolated NSIS source/model regressions with `node --test .\scripts\test-nsis-uninstall.mjs`. These checks simulate sharing locks, missing files, readback failures, and recovery without executing an installer or touching Windows metadata. Template compilation and disposable-VM uninstall/upgrade qualification remain separate release gates.
+Run the isolated NSIS source/model regressions with `node --test .\scripts\test-nsis-uninstall.mjs`. These checks simulate sharing locks, missing files, registry deletion/readback failures after payload deletion, and recovery without executing an installer or touching Windows metadata. Rust regressions use injected registry operations, display backends, owned process-handle doubles, and isolated cache paths. Template compilation and disposable-VM uninstall/upgrade qualification remain separate release gates.
 
 For browser-only UI checks, run `npm run dev` and open
 `http://localhost:1420/tests/ui-fixture.html`. This uses Tauri's IPC mocks and
@@ -186,7 +195,7 @@ synthetic settings/displays, not the native application. The fixture accepts
 bundle. `?mixed=1` exercises an All scope containing both HDR and SDR displays.
 `?aliasMerge=1` starts with a disabled `renderer.exe` library row: adding the
 catalog's `game.exe` enables that canonical row and records the alias. Catalog
-removal targets `renderer.exe`, and the running-process view recognizes the
+removal targets the generation-fenced `renderer.exe` row and path, and the running-process view recognizes the
 enabled alias rather than offering a duplicate Add.
 
 Debug builds can exercise the real native window and read the live display
@@ -198,7 +207,7 @@ $env:HDR_AUTOSWITCH_SAFE_TEST_DIR = 'C:\absolute\temporary\test-directory'
 ```
 
 This debug-only mode stores settings under the supplied directory and blocks HDR
-writes, autostart changes, the foreground hook, and background synchronization.
+writes, autostart changes, the foreground hook, and background/manual catalog synchronization.
 Manual controls remain blocked in setup and recovery modes, too. Release builds
 ignore this environment variable.
 

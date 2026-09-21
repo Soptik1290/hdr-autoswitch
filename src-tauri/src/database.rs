@@ -1,9 +1,11 @@
 use crate::config::{HdrApp, HdrType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
-use std::sync::RwLock;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,16 +35,19 @@ pub enum StorefrontLookupError {
     ExcludedGameExecutable,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutableAuthority {
     canonical_exe: String,
     steam_id: Option<String>,
     nominations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogEntry {
     pub name: String,
+    /// Explicit equivalent product names, authored only in the embedded catalog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub name_aliases: Vec<String>,
     pub exe_name: String,
     pub hdr_type: HdrType,
     pub support_tier: String, // "native", "limited", "always_on", "manual_fix", "autohdr", "media"
@@ -183,22 +188,131 @@ pub fn find_storefront_binding<'a>(
 
 static EMBEDDED_CATALOG_JSON: &str = include_str!("../catalog.json");
 
-static CACHED_CATALOG: RwLock<Option<Vec<CatalogEntry>>> = RwLock::new(None);
+static CACHED_CATALOG: CatalogCache = CatalogCache::new();
 
-fn get_cache_path() -> PathBuf {
-    let app_data = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(app_data).join("HDRAutoSwitch").join("catalog_cache.json")
+struct CatalogCacheState {
+    entries: Option<Vec<CatalogEntry>>,
+    revision: u64,
 }
 
-pub fn get_full_catalog() -> Vec<CatalogEntry> {
-    if let Ok(read_guard) = CACHED_CATALOG.read() {
-        if let Some(ref cat) = *read_guard {
-            return cat.clone();
+struct CatalogCache {
+    state: RwLock<CatalogCacheState>,
+    syncing: AtomicBool,
+}
+
+struct CatalogSync<'a>(&'a AtomicBool);
+
+impl Drop for CatalogSync<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl CatalogCache {
+    const fn new() -> Self {
+        Self {
+            state: RwLock::new(CatalogCacheState { entries: None, revision: 0 }),
+            syncing: AtomicBool::new(false),
         }
     }
 
-    let cache_file = get_cache_path();
-    let cached = match fs::read_to_string(cache_file) {
+    fn begin_sync(&self) -> Result<CatalogSync<'_>, String> {
+        self.syncing.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "Catalog synchronization is already in progress.".to_string())?;
+        Ok(CatalogSync(&self.syncing))
+    }
+
+    fn snapshot(&self, path: &Path) -> Result<(Vec<CatalogEntry>, u64), String> {
+        self.snapshot_with(path, read_cached_catalog)
+    }
+
+    fn snapshot_with(
+        &self,
+        path: &Path,
+        load: impl FnOnce(&Path) -> Vec<CatalogEntry>,
+    ) -> Result<(Vec<CatalogEntry>, u64), String> {
+        {
+            let state = self.state.read().map_err(|_| "Catalog cache lock is poisoned.")?;
+            if let Some(entries) = &state.entries {
+                return Ok((entries.clone(), state.revision));
+            }
+        }
+        let mut state = self.state.write().map_err(|_| "Catalog cache lock is poisoned.")?;
+        // A publisher or another cold reader may have populated the cache while we waited.
+        if state.entries.is_none() {
+            state.entries = Some(merge_catalog(embedded_catalog(), load(path)));
+        }
+        Ok((state.entries.as_ref().unwrap().clone(), state.revision))
+    }
+
+    fn publish(
+        &self,
+        path: &Path,
+        entries: &[CatalogEntry],
+        expected_revision: Option<u64>,
+    ) -> Result<Vec<CatalogEntry>, String> {
+        self.publish_with(path, entries, expected_revision, write_cache_atomically)
+    }
+
+    fn publish_with(
+        &self,
+        path: &Path,
+        entries: &[CatalogEntry],
+        expected_revision: Option<u64>,
+        write: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
+    ) -> Result<Vec<CatalogEntry>, String> {
+        let mut state = self.state.write().map_err(|_| "Catalog cache lock is poisoned.")?;
+        if expected_revision.is_some_and(|expected| expected != state.revision) {
+            return Err("The catalog changed during synchronization. Retry the sync.".into());
+        }
+        let revision = state.revision.checked_add(1).ok_or("Catalog revision exhausted.")?;
+        let entries = with_embedded_authority(entries.to_vec());
+        let json = serde_json::to_vec_pretty(&entries).map_err(|error| error.to_string())?;
+        // Disk replacement and memory publication are one serialized transaction. Failed writes
+        // leave both the last complete disk document and the in-memory snapshot unchanged.
+        write(path, &json)?;
+        state.entries = Some(entries.clone());
+        state.revision = revision;
+        Ok(entries)
+    }
+}
+
+fn get_cache_path() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        Err("Catalog I/O requires an explicitly injected path in tests.".into())
+    }
+    #[cfg(not(test))]
+    {
+        let app_data = std::env::var_os("APPDATA").filter(|value| !value.is_empty())
+            .ok_or("APPDATA is unavailable; the catalog cache cannot be located.")?;
+        let app_data = PathBuf::from(app_data);
+        if !app_data.is_absolute() {
+            return Err("APPDATA must identify an absolute catalog cache location.".into());
+        }
+        Ok(app_data.join("HDRAutoSwitch").join("catalog_cache.json"))
+    }
+}
+
+pub fn get_full_catalog() -> Vec<CatalogEntry> {
+    #[cfg(test)]
+    {
+        merge_catalog(embedded_catalog(), Vec::new())
+    }
+    #[cfg(not(test))]
+    {
+        match get_cache_path().and_then(|path| CACHED_CATALOG.snapshot(&path)) {
+            Ok((entries, _)) => entries,
+            Err(error) => {
+                eprintln!("{error} Using embedded catalog.");
+                merge_catalog(embedded_catalog(), Vec::new())
+            }
+        }
+    }
+}
+
+fn read_cached_catalog(path: &Path) -> Vec<CatalogEntry> {
+    match fs::read_to_string(path) {
         Ok(content) => match serde_json::from_str::<Vec<CatalogEntry>>(&content) {
             Ok(entries) => entries,
             Err(error) => {
@@ -211,101 +325,168 @@ pub fn get_full_catalog() -> Vec<CatalogEntry> {
             eprintln!("Cannot read catalog cache; using embedded catalog: {error}");
             Vec::new()
         }
-    };
-    let entries = merge_catalog(embedded_catalog(), cached);
-
-    if let Ok(mut write_guard) = CACHED_CATALOG.write() {
-        *write_guard = Some(entries.clone());
     }
-
-    entries
 }
 
 fn embedded_catalog() -> Vec<CatalogEntry> {
     serde_json::from_str(EMBEDDED_CATALOG_JSON).expect("Embedded catalog must be valid")
 }
 
-fn merge_catalog(embedded: Vec<CatalogEntry>, cached: Vec<CatalogEntry>) -> Vec<CatalogEntry> {
-    let mut catalog_map: HashMap<String, CatalogEntry> = HashMap::new();
-    let mut legacy_bindings: HashMap<String, Vec<StorefrontBinding>> = HashMap::new();
+#[derive(Clone, PartialEq, Eq)]
+struct DisplayMetadata {
+    support_tier: String,
+    notes: Option<String>,
+}
 
-    // Capture legacy authority before the existing display/alias merge can change its identity.
-    for emb in embedded {
-        let key = clean_key(&emb.name);
-        legacy_bindings.entry(key.clone()).or_default().extend(emb.legacy_steam_binding());
-        catalog_map
-            .entry(key)
-            .and_modify(|existing| {
-                existing.storefronts.extend(emb.storefronts.clone());
-                if existing.steam_id.is_none() && emb.steam_id.is_some() {
-                    existing.steam_id = emb.steam_id.clone();
-                }
-                let emb_exe = emb.exe_name.to_lowercase();
-                if !emb_exe.is_empty() && emb_exe != existing.exe_name.to_lowercase() && !existing.alternate_exes.contains(&emb_exe) {
-                    existing.alternate_exes.push(emb_exe);
-                }
-                for alt in &emb.alternate_exes {
-                    let alt_clean = alt.to_lowercase();
-                    if !existing.alternate_exes.contains(&alt_clean) && alt_clean != existing.exe_name.to_lowercase() {
-                        existing.alternate_exes.push(alt_clean);
-                    }
-                }
-            })
-            .or_insert(emb);
-    }
+struct DisplayOverlay {
+    canonical: bool,
+    metadata: Option<DisplayMetadata>,
+}
 
-    for (key, entry) in &mut catalog_map {
+fn merge_catalog(mut embedded: Vec<CatalogEntry>, cached: Vec<CatalogEntry>) -> Vec<CatalogEntry> {
+    let mut identities: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, entry) in embedded.iter_mut().enumerate() {
         let mut bindings = entry.storefronts.clone();
         if !bindings.iter().any(|binding| binding.provider == StorefrontProvider::Steam) {
-            bindings.extend(legacy_bindings.remove(key).unwrap_or_default());
+            bindings.extend(entry.legacy_steam_binding());
         }
         entry.storefront_authority = Some(bindings);
         entry.capture_executable_authority();
+        for name in std::iter::once(&entry.name).chain(&entry.name_aliases) {
+            let indices = identities.entry(clean_key(name)).or_default();
+            if !indices.contains(&index) {
+                indices.push(index);
+            }
+        }
     }
 
+    // Never merge authored rows by executable, product ID, or fuzzy name. Conflicting source
+    // rows stay separate and ambiguous. Only explicit names can target a display-only overlay.
+    let mut overlays: HashMap<usize, DisplayOverlay> = HashMap::new();
+    let mut suggestions: HashMap<String, Option<CatalogEntry>> = HashMap::new();
     for mut entry in cached {
+        if !valid_catalog_entry(&entry) {
+            continue;
+        }
+        let key = clean_key(&entry.name);
+        if let Some(indices) = identities.get(&key) {
+            if let [index] = indices.as_slice() {
+                let canonical = key == clean_key(&embedded[*index].name);
+                let metadata = DisplayMetadata { support_tier: entry.support_tier, notes: entry.notes };
+                overlays.entry(*index).and_modify(|overlay| {
+                    if canonical && !overlay.canonical {
+                        overlay.canonical = true;
+                        overlay.metadata = Some(metadata.clone());
+                    } else if canonical == overlay.canonical && overlay.metadata.as_ref() != Some(&metadata) {
+                        overlay.metadata = None;
+                    }
+                }).or_insert(DisplayOverlay { canonical, metadata: Some(metadata) });
+            }
+            continue;
+        }
         restrict_storefront_authority(&mut entry, None);
-        catalog_map.entry(clean_key(&entry.name)).or_insert(entry);
+        suggestions.entry(key).and_modify(|existing| {
+            if existing.as_ref() != Some(&entry) {
+                *existing = None;
+            }
+        }).or_insert(Some(entry));
+    }
+    for (index, overlay) in overlays {
+        if let Some(metadata) = overlay.metadata {
+            embedded[index].support_tier = metadata.support_tier;
+            embedded[index].notes = metadata.notes;
+        }
     }
 
-    let mut entries: Vec<CatalogEntry> = catalog_map.into_values().collect();
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    entries
+    embedded.extend(suggestions.into_values().flatten());
+    embedded.sort_by(|a, b| a.name.cmp(&b.name));
+    embedded
 }
 
 fn restrict_storefront_authority(entry: &mut CatalogEntry, embedded: Option<&CatalogEntry>) {
-    entry.storefronts = embedded.map(|source| source.storefronts.clone()).unwrap_or_default();
-    entry.storefront_authority = Some(
-        embedded.map(CatalogEntry::authoritative_bindings).unwrap_or_default(),
-    );
-    entry.executable_authority = embedded.and_then(|source| source.executable_authority.clone());
+    if let Some(source) = embedded {
+        let support_tier = entry.support_tier.clone();
+        let notes = entry.notes.clone();
+        *entry = source.clone();
+        entry.support_tier = support_tier;
+        entry.notes = notes;
+    } else {
+        entry.name_aliases.clear();
+        entry.storefronts.clear();
+        entry.storefront_authority = Some(Vec::new());
+        entry.executable_authority = None;
+    }
 }
 
-// Also used before populating the in-memory cache: sync must not bypass the disk-load boundary.
-fn with_embedded_authority(mut entries: Vec<CatalogEntry>) -> Vec<CatalogEntry> {
-    let embedded: HashMap<String, CatalogEntry> = merge_catalog(embedded_catalog(), Vec::new())
-        .into_iter()
-        .map(|entry| (clean_key(&entry.name), entry))
-        .collect();
-    for entry in &mut entries {
-        restrict_storefront_authority(entry, embedded.get(&clean_key(&entry.name)));
-    }
-    entries
+// Online results, disk reloads, and explicit saves use exactly the same merge policy.
+fn with_embedded_authority(entries: Vec<CatalogEntry>) -> Vec<CatalogEntry> {
+    merge_catalog(embedded_catalog(), entries)
 }
 
 pub fn save_to_cache(entries: &[CatalogEntry]) -> Result<(), String> {
-    let entries = with_embedded_authority(entries.to_vec());
-    let cache_file = get_cache_path();
-    if let Some(parent) = cache_file.parent() {
+    CACHED_CATALOG.publish(&get_cache_path()?, entries, None).map(|_| ())
+}
+
+struct CacheStage(PathBuf);
+
+impl Drop for CacheStage {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn write_cache_atomically(path: &Path, json: &[u8]) -> Result<(), String> {
+    write_cache_atomically_with(path, json, |_| Ok(()))
+}
+
+fn write_cache_atomically_with(
+    path: &Path,
+    json: &[u8],
+    before_replace: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("Cannot create catalog cache: {error}"))?;
     }
-    let json = serde_json::to_string_pretty(&entries).map_err(|error| error.to_string())?;
-    fs::write(&cache_file, json).map_err(|error| format!("Cannot save catalog cache: {error}"))?;
-    let mut write_guard = CACHED_CATALOG
-        .write()
-        .map_err(|_| "Catalog cache lock is poisoned.".to_string())?;
-    *write_guard = Some(entries);
-    Ok(())
+    let stage_path = path.with_file_name(format!(".catalog-cache-{}.stage", uuid::Uuid::new_v4()));
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&stage_path)
+        .map_err(|error| format!("Cannot stage catalog cache: {error}"))?;
+    let stage = CacheStage(stage_path);
+    let flushed = file.write_all(json).and_then(|_| file.sync_all());
+    drop(file);
+    flushed.map_err(|error| format!("Cannot flush catalog cache: {error}"))?;
+    before_replace(&stage.0)?;
+    replace_cache_file(&stage.0, path)
+}
+
+#[cfg(windows)]
+fn replace_cache_file(stage: &Path, path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let wide = |path: &Path| -> Result<Vec<u16>, String> {
+        let mut value: Vec<_> = path.as_os_str().encode_wide().collect();
+        if value.contains(&0) {
+            return Err("Catalog cache path contains a NUL character.".into());
+        }
+        value.push(0);
+        Ok(value)
+    };
+    let from = wide(stage)?;
+    let to = wide(path)?;
+    unsafe {
+        MoveFileExW(
+            PCWSTR(from.as_ptr()),
+            PCWSTR(to.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }.map_err(|error| format!("Cannot replace catalog cache: {error}"))
+}
+
+#[cfg(not(windows))]
+fn replace_cache_file(stage: &Path, path: &Path) -> Result<(), String> {
+    fs::rename(stage, path).map_err(|error| format!("Cannot replace catalog cache: {error}"))
 }
 
 #[allow(dead_code)]
@@ -328,24 +509,37 @@ pub fn get_default_catalog() -> Vec<HdrApp> {
 
 pub fn find_in_catalog(exe_name: &str) -> Option<CatalogEntry> {
     let catalog = get_full_catalog();
+    find_catalog_suggestion(&catalog, exe_name)
+}
+
+fn unique_catalog_match(
+    catalog: &[CatalogEntry],
+    predicate: impl Fn(&CatalogEntry) -> bool,
+) -> Result<Option<&CatalogEntry>, ()> {
+    let mut matches = catalog.iter().filter(|entry| predicate(entry));
+    let found = matches.next();
+    if matches.next().is_some() { Err(()) } else { Ok(found) }
+}
+
+fn find_catalog_suggestion(catalog: &[CatalogEntry], exe_name: &str) -> Option<CatalogEntry> {
     let exe_clean = exe_name.to_lowercase();
     let exe_stem = exe_clean.trim_end_matches(".exe");
 
     // 1. Direct match with entry.exe_name or entry.alternate_exes
-    if let Some(entry) = catalog.iter().find(|c| {
+    if let Some(entry) = unique_catalog_match(catalog, |c| {
         c.exe_name.eq_ignore_ascii_case(&exe_clean)
             || c.alternate_exes.iter().any(|alt| alt.eq_ignore_ascii_case(&exe_clean))
-    }) {
+    }).ok()? {
         return Some(entry.clone());
     }
 
     // 2. Direct match with clean stem against entry.name (e.g. "forzahorizon5" == clean_key("Forza Horizon 5"))
     let clean_exe_alphanumeric: String = exe_stem.chars().filter(|c| c.is_alphanumeric()).collect();
     if clean_exe_alphanumeric.len() >= 3 {
-        if let Some(entry) = catalog.iter().find(|c| {
+        if let Some(entry) = unique_catalog_match(catalog, |c| {
             let cat_clean = clean_key(&c.name);
             cat_clean == clean_exe_alphanumeric
-        }) {
+        }).ok()? {
             return Some(entry.clone());
         }
     }
@@ -360,7 +554,7 @@ pub fn find_in_catalog(exe_name: &str) -> Option<CatalogEntry> {
         .replace("_vk", "");
     let clean_stripped: String = stripped_stem.chars().filter(|c| c.is_alphanumeric()).collect();
     if clean_stripped.len() >= 3 && clean_stripped != clean_exe_alphanumeric {
-        if let Some(entry) = catalog.iter().find(|c| {
+        if let Some(entry) = unique_catalog_match(catalog, |c| {
             let cat_exe_clean = c.exe_name.to_lowercase();
             let cat_stem = cat_exe_clean.trim_end_matches(".exe");
             let cat_clean = clean_key(&c.name);
@@ -370,7 +564,7 @@ pub fn find_in_catalog(exe_name: &str) -> Option<CatalogEntry> {
                     let alt_stem = alt.to_lowercase();
                     alt_stem.trim_end_matches(".exe") == stripped_stem
                 })
-        }) {
+        }).ok()? {
             return Some(entry.clone());
         }
     }
@@ -380,10 +574,14 @@ pub fn find_in_catalog(exe_name: &str) -> Option<CatalogEntry> {
 
 
 pub async fn fetch_online_database() -> Result<Vec<CatalogEntry>, String> {
-    let current_catalog = get_full_catalog();
+    // Do not hold a blocking lock across network awaits. The guard is cancellation-safe and
+    // rejects overlapping startup/manual fetches before either captures a stale snapshot.
+    let cache_path = get_cache_path()?;
+    let _sync = CACHED_CATALOG.begin_sync()?;
+    let (current_catalog, revision) = CACHED_CATALOG.snapshot(&cache_path)?;
     let mut catalog_map: HashMap<String, CatalogEntry> = current_catalog
         .into_iter()
-        .map(|entry| (clean_key(&entry.name), entry))
+        .map(|entry| (catalog_key(&entry.name), entry))
         .collect();
 
     let client = reqwest::Client::builder()
@@ -430,7 +628,7 @@ pub async fn fetch_online_database() -> Result<Vec<CatalogEntry>, String> {
     if !pcgw_fetched.is_empty() {
         fetched = true;
         for (name, supported) in pcgw_fetched {
-            let key = clean_key(&name);
+            let key = catalog_key(&name);
             let (tier, hdr_type, notes) = match supported.as_str() {
                 "hackable" => ("manual_fix", HdrType::Custom, "Vyžaduje úpravu / mod / Special K (PCGamingWiki)"),
                 "limited" => ("limited", HdrType::Native, "Omezená nativní podpora HDR (PCGamingWiki)"),
@@ -442,6 +640,7 @@ pub async fn fetch_online_database() -> Result<Vec<CatalogEntry>, String> {
                 .entry(key)
                 .and_modify(|existing| {
                     existing.support_tier = tier.to_string();
+                    existing.notes = Some(notes.to_string());
                 })
                 .or_insert_with(|| {
                     let clean_exe = name
@@ -451,6 +650,7 @@ pub async fn fetch_online_database() -> Result<Vec<CatalogEntry>, String> {
                         .collect::<String>();
                     CatalogEntry {
                         name,
+                        name_aliases: Vec::new(),
                         exe_name: format!("{}.exe", clean_exe),
                         hdr_type,
                         support_tier: tier.to_string(),
@@ -506,7 +706,7 @@ pub async fn fetch_online_database() -> Result<Vec<CatalogEntry>, String> {
                 if let Ok(entries) = res.json::<Vec<CatalogEntry>>().await {
                     for entry in entries.into_iter().filter(valid_catalog_entry) {
                         fetched = true;
-                        catalog_map.insert(clean_key(&entry.name), entry);
+                        catalog_map.insert(catalog_key(&entry.name), entry);
                     }
                 }
             }
@@ -514,8 +714,7 @@ pub async fn fetch_online_database() -> Result<Vec<CatalogEntry>, String> {
     }
 
     let result = synced_catalog(fetched, catalog_map)?;
-    save_to_cache(&result)?;
-    Ok(result)
+    CACHED_CATALOG.publish(&cache_path, &result, Some(revision))
 }
 
 fn valid_catalog_entry(entry: &CatalogEntry) -> bool {
@@ -543,6 +742,24 @@ fn clean_key(s: &str) -> String {
         .chars()
         .filter(|c| c.is_alphanumeric())
         .collect()
+}
+
+fn catalog_key(name: &str) -> String {
+    static ALIASES: OnceLock<HashMap<String, String>> = OnceLock::new();
+    let aliases = ALIASES.get_or_init(|| {
+        let mut names: HashMap<String, Vec<String>> = HashMap::new();
+        for entry in embedded_catalog() {
+            let canonical = clean_key(&entry.name);
+            for name in std::iter::once(&entry.name).chain(&entry.name_aliases) {
+                names.entry(clean_key(name)).or_default().push(canonical.clone());
+            }
+        }
+        names.into_iter().filter_map(|(name, canonical)| {
+            (canonical.len() == 1).then(|| (name, canonical[0].clone()))
+        }).collect()
+    });
+    let key = clean_key(name);
+    aliases.get(&key).cloned().unwrap_or(key)
 }
 
 fn parse_pcgw_table_html(html: &str, out: &mut Vec<(String, String)>) {
@@ -602,9 +819,10 @@ fn parse_pcgw_autohdr_wikitext(wikitext: &str, map: &mut HashMap<String, Catalog
             continue;
         }
         recognized += 1;
-        let key = clean_key(game_name);
+        let key = catalog_key(game_name);
         map.entry(key.clone()).or_insert_with(|| CatalogEntry {
             name: game_name.to_string(),
+            name_aliases: Vec::new(),
             exe_name: format!("{key}.exe"),
             hdr_type: HdrType::AutoHdr,
             support_tier: "autohdr".to_string(),
@@ -795,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_title_merging_preserves_ambiguous_explicit_and_legacy_authority() {
+    fn duplicate_embedded_titles_remain_separate_and_ambiguous() {
         for explicit in [false, true] {
             let mut first = legacy_entry();
             if explicit {
@@ -809,15 +1027,15 @@ mod tests {
             }
             for embedded in [vec![first.clone(), second.clone()], vec![second, first]] {
                 let merged = merge_catalog(embedded, Vec::new());
-                assert_eq!(merged.len(), 1);
-                assert_eq!(merged[0].storefront_binding(StorefrontProvider::Steam, Some("123")),
+                assert_eq!(merged.len(), 2);
+                assert_eq!(find_storefront_binding(&merged, StorefrontProvider::Steam, Some("123")),
                     Err(StorefrontLookupError::AmbiguousBindings));
             }
         }
     }
 
     #[test]
-    fn embedded_title_merging_does_not_reassign_legacy_exe_or_override_explicit_steam() {
+    fn equal_titles_do_not_inherit_another_rows_executables_or_products() {
         let legacy = legacy_entry();
         let mut suggestion = legacy.clone();
         suggestion.steam_id = None;
@@ -826,14 +1044,23 @@ mod tests {
         explicit.storefronts = vec![binding(StorefrontProvider::Steam, Some("456"), &[], &[])];
         for embedded in [vec![suggestion.clone(), legacy.clone()], vec![legacy.clone(), suggestion]] {
             let merged = merge_catalog(embedded, Vec::new());
-            assert_eq!(merged[0].storefront_binding(StorefrontProvider::Steam, None).unwrap().unwrap()
-                .game_executables, ["legacy.exe"]);
+            assert_eq!(merged.len(), 2);
+            let (_, binding) = find_storefront_binding(&merged, StorefrontProvider::Steam, Some("123"))
+                .unwrap().unwrap();
+            assert_eq!(binding.game_executables, ["legacy.exe"]);
+            let suggestion = merged.iter().find(|entry| entry.steam_id.is_none()).unwrap();
+            assert_eq!(suggestion.storefront_binding(StorefrontProvider::Steam, None), Ok(None));
+            assert!(!suggestion.authorizes_declared_executable("legacy.exe"));
         }
         for embedded in [vec![legacy.clone(), explicit.clone()], vec![explicit, legacy]] {
             let merged = merge_catalog(embedded, Vec::new());
-            assert_eq!(merged[0].storefront_binding(StorefrontProvider::Steam, Some("123")), Ok(None));
-            assert_eq!(merged[0].storefront_binding(StorefrontProvider::Steam, None).unwrap().unwrap()
-                .product_id.as_deref(), Some("456"));
+            assert_eq!(merged.len(), 2);
+            assert_eq!(find_storefront_binding(&merged, StorefrontProvider::Steam, None),
+                Err(StorefrontLookupError::AmbiguousBindings));
+            assert_eq!(find_storefront_binding(&merged, StorefrontProvider::Steam, Some("123"))
+                .unwrap().unwrap().1.game_executables, ["legacy.exe"]);
+            assert!(find_storefront_binding(&merged, StorefrontProvider::Steam, Some("456"))
+                .unwrap().unwrap().1.game_executables.is_empty());
         }
     }
 
@@ -893,12 +1120,13 @@ mod tests {
             let legacy = catalog.iter().find(|entry| entry.name == "Age of Empires IV").unwrap();
             assert_eq!(legacy.storefront_binding(StorefrontProvider::Steam, None).unwrap().unwrap(),
                 binding(StorefrontProvider::Steam, Some("1466860"), &["ageofempiresiv.exe"], &[]));
-            assert_eq!(legacy.exe_name, "untrusted.exe");
+            assert_eq!(legacy.exe_name, "ageofempiresiv.exe");
             assert_eq!(legacy.notes.as_deref(), Some("Online display note"));
             let suggestion = catalog.iter().find(|entry| entry.name == "Example game").unwrap();
             assert_eq!(suggestion.storefront_binding(StorefrontProvider::Steam, None), Ok(None));
             let reloaded: Vec<CatalogEntry> = serde_json::from_str(&serde_json::to_string(&catalog).unwrap()).unwrap();
             let merged = merge_catalog(embedded_catalog(), reloaded);
+            assert_eq!(merged, catalog);
             assert_eq!(merged.iter().find(|entry| entry.name == "Example game").unwrap()
                 .storefront_binding(StorefrontProvider::Steam, None), Ok(None));
         }
@@ -1116,8 +1344,8 @@ mod tests {
         assert_eq!(aoe3.storefront_binding(StorefrontProvider::Steam, None), Ok(None));
         assert_eq!(aoe3.storefront_binding(StorefrontProvider::Xbox, None).unwrap().unwrap(),
             binding(StorefrontProvider::Xbox, None, &["aoe3de.exe"], &["gamelaunchhelper.exe"]));
-        assert!(find_in_catalog("aoe3de.exe").is_none());
-        assert!(find_in_catalog("gamelaunchhelper.exe").is_none());
+        assert!(find_catalog_suggestion(&catalog, "aoe3de.exe").is_none());
+        assert!(find_catalog_suggestion(&catalog, "gamelaunchhelper.exe").is_none());
         let aoe4 = catalog.iter().find(|entry| entry.steam_id.as_deref() == Some("1466860")).unwrap();
         assert!(aoe4.storefronts.is_empty());
         assert_eq!(aoe4.storefront_binding(StorefrontProvider::Steam, None).unwrap().unwrap()
@@ -1181,5 +1409,384 @@ mod tests {
         assert!(!valid_catalog_entry(&entry));
         entry.exe_name = r"C:\game.exe".into();
         assert!(!valid_catalog_entry(&entry));
+    }
+
+    const CANONICAL_PRODUCTS: [(&str, &str, &str, &str, &str); 5] = [
+        ("Baldur's Gate 3", "Baldur's Gate 3 (DX11)", "1086940", "bg3.exe", "bg3_dx11.exe"),
+        ("Dead Space (2023)", "Dead Space Remake", "1693980", "deadspace.exe", "deadspace.exe"),
+        ("Resident Evil 2 (2019)", "Resident Evil 2 Remake", "883710", "re2.exe", "re2.exe"),
+        ("Resident Evil 3 (2020)", "Resident Evil 3 Remake", "952060", "re3.exe", "re3.exe"),
+        ("Resident Evil 4 (2023)", "Resident Evil 4 Remake", "2050650", "re4.exe", "re4.exe"),
+    ];
+
+    #[test]
+    fn full_catalog_identities_and_provider_bindings_are_valid_and_unique() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let catalog = merge_catalog(embedded_catalog(), Vec::new());
+        let mut identities = BTreeSet::new();
+        let mut products = BTreeSet::new();
+        let mut executables: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        assert!(catalog.len() > 1000);
+        for entry in &catalog {
+            assert!(valid_catalog_entry(entry), "{}", entry.name);
+            for name in std::iter::once(&entry.name).chain(&entry.name_aliases) {
+                assert!(!clean_key(name).is_empty());
+                assert!(identities.insert(clean_key(name)), "Duplicate identity: {name}");
+            }
+            let nominations: Vec<_> = std::iter::once(entry.exe_name.clone())
+                .chain(entry.alternate_exes.clone()).collect();
+            for exe in normalized_executables(&nominations).unwrap() {
+                executables.entry(exe).or_default().push(entry.name.clone());
+            }
+            for binding in entry.authoritative_bindings() {
+                let binding = binding.normalized().unwrap();
+                if let Some(product) = binding.product_id.as_deref() {
+                    if binding.provider == StorefrontProvider::Steam {
+                        assert!(product.parse::<u32>().is_ok_and(|id| id > 0));
+                    }
+                    assert!(products.insert(format!("{:?}:{product}", binding.provider)),
+                        "Duplicate product: {} {binding:?}", entry.name);
+                    let (found, normalized) = find_storefront_binding(
+                        &catalog, binding.provider, Some(product),
+                    ).unwrap().unwrap();
+                    assert_eq!(found.name, entry.name);
+                    assert_eq!(normalized, binding);
+                }
+            }
+        }
+        let overlaps: BTreeMap<_, _> = executables.into_iter()
+            .filter(|(_, entries)| entries.len() > 1).collect();
+        let expected: BTreeMap<_, _> = [
+            ("cod.exe", ["Call of Duty: Modern Warfare II (2022)", "Call of Duty: Warzone"]),
+            ("hitman.exe", ["Hitman", "Hitman World of Assassination"]),
+            ("masseffect1.exe", ["Mass Effect 1 (LE)", "Mass Effect Legendary Edition"]),
+            ("masseffect2.exe", ["Mass Effect 2 (LE)", "Mass Effect Legendary Edition"]),
+            ("masseffect3.exe", ["Mass Effect 3 (LE)", "Mass Effect Legendary Edition"]),
+            ("tll.exe", ["Uncharted: Legacy of Thieves Collection", "Uncharted: The Lost Legacy"]),
+        ].into_iter().map(|(exe, names)| (
+            exe.to_string(), names.into_iter().map(str::to_string).collect::<Vec<_>>(),
+        )).collect();
+        assert_eq!(overlaps, expected, "New overlaps require an explicit identity audit");
+    }
+
+    #[test]
+    fn canonical_products_resolve_with_real_provider_evidence_before_and_after_reload() {
+        use crate::automatic_authority::{self, Authority, InstallEvidence, Provider};
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let catalog = merge_catalog(embedded_catalog(), Vec::new());
+        let mut aliases = Vec::new();
+        for (name, alias, id, primary, declared) in CANONICAL_PRODUCTS {
+            let entry = catalog.iter().find(|entry| entry.name == name).unwrap();
+            assert_eq!(entry.name_aliases, [alias]);
+            assert_eq!(entry.steam_id.as_deref(), Some(id));
+            assert_eq!(entry.exe_name, primary);
+            assert!(!catalog.iter().any(|entry| entry.name == alias));
+            assert_eq!(catalog_key(alias), clean_key(name));
+            for exe in [primary, declared] {
+                fs::write(root.path().join(exe), b"fixture, never executed").unwrap();
+            }
+            let mut old_row = entry.clone();
+            old_row.name = alias.into();
+            old_row.notes = Some("Updated display metadata".into());
+            old_row.exe_name = "untrusted.exe".into();
+            old_row.alternate_exes = vec!["untrusted-alias.exe".into()];
+            old_row.steam_id = Some("999".into());
+            aliases.push(old_row);
+        }
+        let synced = with_embedded_authority(aliases);
+        let decoded = serde_json::from_slice(&serde_json::to_vec(&synced).unwrap()).unwrap();
+        let reloaded = merge_catalog(embedded_catalog(), decoded);
+        assert_eq!(synced, reloaded);
+        for mut catalog in [catalog, synced, reloaded] {
+            for _ in 0..2 {
+                for (name, _, id, primary, declared) in CANONICAL_PRODUCTS {
+                    for provider in [Provider::Steam, Provider::Epic, Provider::Gog, Provider::Windows] {
+                        let exe = if provider == Provider::Steam { primary } else { declared };
+                        let observed = InstallEvidence::observe(
+                            provider, (provider == Provider::Steam).then_some(id),
+                            root.path(), &[exe.into()],
+                        ).unwrap();
+                        let Authority::Resolved(resolved) = automatic_authority::resolve(&catalog, Some(&observed)) else {
+                            panic!("{provider:?}: canonical product {name} did not resolve");
+                        };
+                        assert_eq!(resolved.catalog.name, name);
+                        assert_eq!(resolved.as_app(true).exe_name, exe);
+                    }
+                    let observed = InstallEvidence::observe(
+                        Provider::Xbox, Some(id), root.path(), &[declared.into()],
+                    ).unwrap();
+                    assert!(matches!(automatic_authority::resolve(&catalog, Some(&observed)), Authority::Unresolved));
+                }
+                catalog.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn shared_basenames_stay_ambiguous_without_distinct_provider_products() {
+        use crate::automatic_authority::{self, Authority, InstallEvidence, Provider};
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let mut catalog = merge_catalog(embedded_catalog(), Vec::new());
+        for exe in ["cod.exe", "hitman.exe", "masseffect1.exe", "masseffect2.exe", "masseffect3.exe", "tll.exe"] {
+            fs::write(root.path().join(exe), b"fixture, never executed").unwrap();
+            for _ in 0..2 {
+                assert!(find_catalog_suggestion(&catalog, exe).is_none(), "{exe}");
+                for provider in [Provider::Epic, Provider::Gog, Provider::Windows] {
+                    let observed = InstallEvidence::observe(provider, None, root.path(), &[exe.into()]).unwrap();
+                    assert!(matches!(automatic_authority::resolve(&catalog, Some(&observed)), Authority::Ambiguous),
+                        "{provider:?} must not pick the first {exe}");
+                }
+                catalog.reverse();
+            }
+        }
+        for (id, name) in [
+            ("1938090", "Call of Duty: Modern Warfare II (2022)"),
+            ("1962663", "Call of Duty: Warzone"),
+        ] {
+            let observed = InstallEvidence::observe(
+                Provider::Steam, Some(id), root.path(), &["cod.exe".into()],
+            ).unwrap();
+            let Authority::Resolved(resolved) = automatic_authority::resolve(&catalog, Some(&observed)) else {
+                panic!("Distinct Steam product {id} must remain usable");
+            };
+            assert_eq!(resolved.catalog.name, name);
+        }
+    }
+
+    #[test]
+    fn explicit_name_overlays_are_order_independent_and_never_reintroduce_duplicate_authority() {
+        let source = embedded_catalog().into_iter()
+            .find(|entry| entry.name == "Dead Space (2023)").unwrap();
+        let mut canonical = source.clone();
+        canonical.notes = Some("Canonical update".into());
+        let mut alias = source.clone();
+        alias.name = "Dead Space Remake".into();
+        alias.notes = Some("Alias update".into());
+        for updates in [vec![canonical.clone(), alias.clone()], vec![alias.clone(), canonical.clone()]] {
+            let merged = merge_catalog(vec![source.clone()], updates);
+            assert_eq!(merged.len(), 1);
+            assert_eq!(merged[0].notes, canonical.notes);
+            assert_eq!(merged[0].exe_name, source.exe_name);
+        }
+        let alias_only = merge_catalog(vec![source.clone()], vec![alias.clone()]);
+        assert_eq!(alias_only.len(), 1);
+        assert_eq!(alias_only[0].name, source.name);
+        assert_eq!(alias_only[0].notes, alias.notes);
+        let mut conflict = alias.clone();
+        conflict.notes = Some("Conflicting alias update".into());
+        for updates in [vec![alias.clone(), conflict.clone()], vec![conflict, alias]] {
+            assert_eq!(merge_catalog(vec![source.clone()], updates)[0].notes, source.notes);
+        }
+        let mut map = HashMap::from([(clean_key(&source.name), source.clone())]);
+        assert_eq!(parse_pcgw_autohdr_wikitext("| [[Dead Space Remake]]", &mut map), 1);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&clean_key(&source.name)].name, source.name);
+    }
+
+    fn display_update(note: &str) -> CatalogEntry {
+        let mut entry = embedded_catalog().into_iter()
+            .find(|entry| entry.name == "Dead Space (2023)").unwrap();
+        entry.support_tier = "limited".into();
+        entry.notes = Some(note.into());
+        entry
+    }
+
+    #[test]
+    fn cache_publication_and_restart_have_identical_display_and_immutable_authority() {
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = root.path().join("cache.json");
+        let cache = CatalogCache::new();
+        let source = merge_catalog(embedded_catalog(), Vec::new());
+        let mut update = display_update("Persist this display note");
+        update.exe_name = "untrusted.exe".into();
+        update.alternate_exes = vec!["untrusted-alias.exe".into()];
+        update.name_aliases = vec!["Untrusted name alias".into()];
+        update.steam_id = Some("999".into());
+        update.hdr_type = HdrType::Custom;
+        update.storefronts = vec![binding(StorefrontProvider::Xbox, None, &["untrusted.exe"], &[])];
+        let mut suggestion = legacy_entry();
+        suggestion.name_aliases = vec!["Another untrusted alias".into()];
+        let synced = synced_catalog(true, [update, suggestion].into_iter()
+            .map(|entry| (clean_key(&entry.name), entry)).collect()).unwrap();
+        let published = cache.publish(&path, &synced, None).unwrap();
+        let reloaded = CatalogCache::new().snapshot(&path).unwrap().0;
+        assert_eq!(published, synced);
+        assert_eq!(cache.snapshot(&path).unwrap().0, reloaded);
+        assert_eq!(published, reloaded);
+        let existing = published.iter().find(|entry| entry.name == "Dead Space (2023)").unwrap();
+        let mut expected = source.iter().find(|entry| entry.name == existing.name).unwrap().clone();
+        expected.notes = Some("Persist this display note".into());
+        expected.support_tier = "limited".into();
+        assert_eq!(existing, &expected);
+        let suggestion = published.iter().find(|entry| entry.name == "Example game").unwrap();
+        assert!(suggestion.name_aliases.is_empty());
+        assert!(suggestion.storefronts.is_empty());
+        assert!(suggestion.executable_authority.is_none());
+        assert_eq!(suggestion.storefront_binding(StorefrontProvider::Steam, None), Ok(None));
+        let mut cleared = expected;
+        cleared.notes = None;
+        cache.publish(&path, &[cleared], None).unwrap();
+        assert!(CatalogCache::new().snapshot(&path).unwrap().0.iter()
+            .find(|entry| entry.name == "Dead Space (2023)").unwrap().notes.is_none());
+    }
+
+    #[test]
+    fn interrupted_cache_publication_preserves_disk_memory_and_revision() {
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = root.path().join("cache.json");
+        let cache = CatalogCache::new();
+        cache.publish(&path, &[display_update("Previous complete snapshot")], None).unwrap();
+        let before = cache.snapshot(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let result = cache.publish_with(&path, &[display_update("Interrupted update")], None, |path, bytes| {
+            write_cache_atomically_with(path, bytes, |stage| {
+                assert_eq!(fs::read(stage).unwrap(), bytes);
+                assert!(serde_json::from_slice::<Vec<CatalogEntry>>(bytes).is_ok());
+                Err("Injected interruption after flush, before replace".into())
+            })
+        });
+        assert!(result.unwrap_err().contains("Injected interruption"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(cache.snapshot(&path).unwrap(), before);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1, "Owned stage must be cleaned");
+
+        let blocked = root.path().join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        assert!(cache.publish(&blocked, &[display_update("Replacement fails")], None).is_err());
+        assert_eq!(cache.snapshot(&path).unwrap(), before);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+
+        // A crash can leave an incomplete sibling stage. It is never a candidate for reload.
+        let orphan = root.path().join(".catalog-cache-interrupted.stage");
+        fs::write(&orphan, br#"[{"name":"unfinished"#).unwrap();
+        assert_eq!(CatalogCache::new().snapshot(&path).unwrap().0, before.0);
+        let missing = root.path().join("never-published.json");
+        assert_eq!(CatalogCache::new().snapshot(&missing).unwrap().0,
+            merge_catalog(embedded_catalog(), Vec::new()));
+        fs::write(&path, br#"[{"name":"truncated old non-atomic cache"#).unwrap();
+        assert_eq!(CatalogCache::new().snapshot(&path).unwrap().0,
+            merge_catalog(embedded_catalog(), Vec::new()));
+    }
+
+    #[test]
+    fn failed_first_cache_publication_leaves_no_published_file_or_memory_snapshot() {
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = root.path().join("cache.json");
+        let cache = CatalogCache::new();
+        assert!(cache.publish_with(&path, &[display_update("Never published")], None, |path, bytes| {
+            write_cache_atomically_with(path, bytes, |_| Err("Interrupted initial save".into()))
+        }).is_err());
+        assert!(!path.exists());
+        assert!(cache.state.read().unwrap().entries.is_none());
+        assert_eq!(cache.state.read().unwrap().revision, 0);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn concurrent_cache_writers_and_readers_observe_only_complete_publications() {
+        use std::sync::{Arc, Barrier};
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = root.path().join("cache.json");
+        let cache = CatalogCache::new();
+        cache.publish(&path, &[display_update("Initial snapshot")], None).unwrap();
+        let start = Arc::new(Barrier::new(9));
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let start = start.clone();
+                let path = &path;
+                let cache = &cache;
+                scope.spawn(move || {
+                    start.wait();
+                    cache.publish(path, &[display_update(&format!("Writer {index}"))], None).unwrap();
+                });
+            }
+            start.wait();
+            for _ in 0..24 {
+                let decoded: Vec<CatalogEntry> = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                let complete = merge_catalog(embedded_catalog(), decoded.clone());
+                assert_eq!(serde_json::to_value(decoded).unwrap(), serde_json::to_value(complete).unwrap());
+            }
+        });
+        let (memory, revision) = cache.snapshot(&path).unwrap();
+        assert_eq!(revision, 9);
+        assert_eq!(memory, CatalogCache::new().snapshot(&path).unwrap().0);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn startup_loading_and_publication_share_the_same_serialization_boundary() {
+        use std::sync::mpsc;
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = root.path().join("cache.json");
+        write_cache_atomically(&path, &serde_json::to_vec(&vec![display_update("Disk at startup")]).unwrap()).unwrap();
+        let cache = CatalogCache::new();
+        let (loading, loaded) = mpsc::channel();
+        let (release, proceed) = mpsc::channel();
+        let (publishing, started) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            let path = &path;
+            let reader = scope.spawn(move || cache.snapshot_with(path, |path| {
+                let entries = read_cached_catalog(path);
+                loading.send(()).unwrap();
+                proceed.recv().unwrap();
+                entries
+            }).unwrap());
+            loaded.recv().unwrap();
+            let writer = scope.spawn(move || {
+                publishing.send(()).unwrap();
+                cache.publish(path, &[display_update("Newest publication")], None).unwrap()
+            });
+            started.recv().unwrap();
+            release.send(()).unwrap();
+            assert_eq!(reader.join().unwrap().1, 0);
+            let published = writer.join().unwrap();
+            assert_eq!(cache.snapshot(path).unwrap().0, published);
+            assert_eq!(CatalogCache::new().snapshot(path).unwrap().0, published);
+        });
+    }
+
+    #[test]
+    fn overlapping_syncs_are_rejected_and_a_stale_fetch_cannot_overwrite_a_newer_publication() {
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = root.path().join("cache.json");
+        let cache = CatalogCache::new();
+        let sync = cache.begin_sync().unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| assert!(cache.begin_sync().is_err())).join().unwrap();
+        });
+        let (stale, revision) = cache.snapshot(&path).unwrap();
+        let latest = cache.publish(&path, &[display_update("Newer publication")], None).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(cache.publish(&path, &stale, Some(revision)).unwrap_err().contains("changed during synchronization"));
+        assert_eq!(cache.snapshot(&path).unwrap().0, latest);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        drop(sync);
+        let _next = cache.begin_sync().unwrap();
+        let revision = cache.snapshot(&path).unwrap().1;
+        cache.publish(&path, &[display_update("Next synchronization")], Some(revision)).unwrap();
+        assert_eq!(cache.snapshot(&path).unwrap().0, CatalogCache::new().snapshot(&path).unwrap().0);
+    }
+
+    #[test]
+    fn default_test_catalog_access_never_uses_appdata_or_the_network() {
+        use std::future::Future;
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        assert_eq!(get_full_catalog(), merge_catalog(embedded_catalog(), Vec::new()));
+        assert!(get_cache_path().unwrap_err().contains("explicitly injected path"));
+        assert!(save_to_cache(&[]).unwrap_err().contains("explicitly injected path"));
+        let waker = Waker::from(Arc::new(Noop));
+        let mut context = Context::from_waker(&waker);
+        let mut fetch = Box::pin(fetch_online_database());
+        assert!(matches!(
+            fetch.as_mut().poll(&mut context),
+            Poll::Ready(Err(error)) if error.contains("explicitly injected path")
+        ));
     }
 }

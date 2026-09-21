@@ -61,6 +61,37 @@ struct Selection {
     skipped: Vec<MonitorOutcome>,
 }
 
+struct ManualWarning {
+    scope: TargetMonitor,
+    message: String,
+}
+
+fn same_inventory(left: &[MonitorInfo], right: &[MonitorInfo]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut unmatched: Vec<_> = right.iter().collect();
+    for monitor in left {
+        let Some(index) = unmatched.iter().position(|other| {
+            monitor.id == other.id
+                && monitor.device_path == other.device_path
+                && monitor.identity_status == other.identity_status
+                && monitor.identity_error == other.identity_error
+                && monitor.name == other.name
+                && monitor.address() == other.address()
+                && monitor.is_hdr_supported == other.is_hdr_supported
+                && monitor.is_hdr_enabled == other.is_hdr_enabled
+                && monitor.hdr_state_known == other.hdr_state_known
+                && monitor.state_error == other.state_error
+                && monitor.is_primary == other.is_primary
+        }) else {
+            return false;
+        };
+        unmatched.swap_remove(index);
+    }
+    true
+}
+
 fn contains_identity(identities: &[String], identity: &str) -> bool {
     identities
         .iter()
@@ -181,7 +212,9 @@ pub(crate) struct HdrController<B: DisplayBackend> {
     records: Vec<ControlRecord>,
     inventory: Vec<MonitorInfo>,
     inventory_error: Option<String>,
+    inventory_revision: u64,
     warnings: VecDeque<String>,
+    manual_warnings: Vec<ManualWarning>,
 }
 
 impl<B: DisplayBackend> HdrController<B> {
@@ -193,7 +226,9 @@ impl<B: DisplayBackend> HdrController<B> {
             records: Vec::new(),
             inventory: Vec::new(),
             inventory_error: None,
+            inventory_revision: 0,
             warnings: VecDeque::new(),
+            manual_warnings: Vec::new(),
         }
     }
 
@@ -209,8 +244,17 @@ impl<B: DisplayBackend> HdrController<B> {
         self.inventory_error.as_deref()
     }
 
+    pub(crate) fn inventory_revision(&self) -> String {
+        self.inventory_revision.to_string()
+    }
+
     pub(crate) fn warning(&self) -> Option<String> {
         let mut warnings: Vec<String> = self.warnings.iter().cloned().collect();
+        for warning in &self.manual_warnings {
+            if !warnings.contains(&warning.message) {
+                warnings.push(warning.message.clone());
+            }
+        }
         if self.has_uncertainty() {
             warnings.push(
                 "HDR may have changed. Automatic writes to uncertain monitors are blocked until an explicitly scoped manual On/Off request is verified".into(),
@@ -254,11 +298,20 @@ impl<B: DisplayBackend> HdrController<B> {
         match self.backend.inventory() {
             Ok(inventory) => {
                 self.observe(&inventory);
+                if self.inventory_revision == 0
+                    || self.inventory_error.is_some()
+                    || !same_inventory(&self.inventory, &inventory)
+                {
+                    self.inventory_revision += 1;
+                }
                 self.inventory = inventory.clone();
                 self.inventory_error = None;
                 Ok(inventory)
             }
             Err(error) => {
+                if self.inventory_error.as_ref() != Some(&error) {
+                    self.inventory_revision += 1;
+                }
                 self.inventory_error = Some(error.clone());
                 Err(error)
             }
@@ -397,7 +450,7 @@ impl<B: DisplayBackend> HdrController<B> {
                 record.attempts.push(attempt.clone());
             })
         });
-        if outcome.outcome != OutcomeKind::OutcomeUnknown {
+        if purpose != NativePurpose::Manual && outcome.outcome != OutcomeKind::OutcomeUnknown {
             if let Some(message) = &outcome.message {
                 self.warn(message.clone());
             }
@@ -453,6 +506,53 @@ impl<B: DisplayBackend> HdrController<B> {
     }
 
     pub(crate) fn manual_set(
+        &mut self,
+        scope: &TargetMonitor,
+        enable: bool,
+        authority: &mut impl WriteAuthority,
+    ) -> Vec<MonitorOutcome> {
+        let outcomes = self.manual_set_inner(scope, enable, authority);
+        self.record_manual_outcomes(scope, &outcomes);
+        outcomes
+    }
+
+    fn record_manual_outcomes(&mut self, scope: &TargetMonitor, outcomes: &[MonitorOutcome]) {
+        for outcome in outcomes {
+            let outcome_scope = match &outcome.device_path {
+                Some(identity) => TargetMonitor::Monitor {
+                    device_path: identity.clone(),
+                    display_name: outcome.display_name.clone().unwrap_or_else(|| identity.clone()),
+                },
+                None => scope.clone(),
+            };
+            if outcome.is_verified() {
+                self.manual_warnings
+                    .retain(|warning| !same_target(&warning.scope, &outcome_scope));
+            } else if outcome.outcome == OutcomeKind::Failed {
+                let message = format!(
+                    "The last manual HDR request failed: {}",
+                    outcome.message.as_deref().unwrap_or("The requested HDR state was not verified"),
+                );
+                let message = match &outcome_scope {
+                    TargetMonitor::Monitor { display_name, .. } => format!("{display_name}: {message}"),
+                    _ => message,
+                };
+                if let Some(warning) = self.manual_warnings.iter_mut()
+                    .find(|warning| same_target(&warning.scope, &outcome_scope))
+                {
+                    warning.message = message;
+                } else {
+                    self.manual_warnings.push(ManualWarning { scope: outcome_scope, message });
+                }
+            }
+        }
+        // A success for one endpoint must not dismiss a failed All request or another display.
+        if !outcomes.is_empty() && outcomes.iter().all(MonitorOutcome::is_verified) {
+            self.manual_warnings.retain(|warning| !same_target(&warning.scope, scope));
+        }
+    }
+
+    fn manual_set_inner(
         &mut self,
         scope: &TargetMonitor,
         enable: bool,
@@ -714,6 +814,137 @@ mod tests {
             .find(|record| record.device_path == path)
             .map(|record| record.state)
             .unwrap_or(ControlState::Unowned)
+    }
+
+    #[test]
+    fn inventory_revision_tracks_metadata_and_topology_without_aggregate_hdr_changes() {
+        let mut engine = HdrController::new(MockDisplay::new(vec![
+            monitor("chosen", 1, false), monitor("other", 2, false),
+        ]));
+        engine.refresh_inventory().unwrap();
+        assert_eq!(engine.inventory_revision(), "1");
+        engine.backend.monitors.reverse();
+        engine.refresh_inventory().unwrap();
+        assert_eq!(engine.inventory_revision(), "1", "enumeration order is not a change");
+        engine.backend.monitors.reverse();
+
+        let changes: [fn(&mut Vec<MonitorInfo>); 9] = [
+            |monitors| monitors.push(monitor("new", 3, false)),
+            |monitors| monitors[1].name = "Renamed display".into(),
+            |monitors| monitors[1].is_hdr_supported = false,
+            |monitors| monitors[1].is_primary = true,
+            |monitors| monitors[1].target_id = 20,
+            |monitors| monitors[1].hdr_state_known = false,
+            |monitors| monitors[1].state_error = Some("Query failed".into()),
+            |monitors| monitors[1].identity_status = TargetStatus::Ambiguous,
+            |monitors| { monitors.pop(); },
+        ];
+        for (index, change) in changes.into_iter().enumerate() {
+            change(&mut engine.backend.monitors);
+            engine.refresh_inventory().unwrap();
+            let revision = (index + 2).to_string();
+            assert_eq!(engine.inventory_revision(), revision);
+            assert_eq!(engine.scope_hdr_state(&chosen()), ScopeHdrState::Sdr);
+            assert!(engine.inventory().iter().all(|monitor| !monitor.is_hdr_enabled));
+            engine.refresh_inventory().unwrap();
+            assert_eq!(engine.inventory_revision(), revision, "identical polls stay quiet");
+        }
+        assert!(engine.backend.writes.is_empty(), "inventory probes never write HDR");
+    }
+
+    #[test]
+    fn inventory_failure_and_recovery_have_revisions_even_for_empty_inventory() {
+        let mut engine = HdrController::new(MockDisplay::new(Vec::new()));
+        engine.refresh_inventory().unwrap();
+        assert_eq!(engine.inventory_revision(), "1");
+        engine.backend.enumeration_error = Some("Read failed".into());
+        assert!(engine.refresh_inventory().is_err());
+        assert_eq!(engine.inventory_revision(), "2");
+        assert!(engine.refresh_inventory().is_err());
+        assert_eq!(engine.inventory_revision(), "2");
+        engine.backend.enumeration_error = None;
+        engine.refresh_inventory().unwrap();
+        assert_eq!(engine.inventory_revision(), "3");
+        engine.refresh_inventory().unwrap();
+        assert_eq!(engine.inventory_revision(), "3");
+        assert!(engine.inventory_error().is_none());
+    }
+
+    #[test]
+    fn inventory_comparison_preserves_duplicate_endpoint_multiplicity() {
+        let first = monitor("first", 1, false);
+        let second = monitor("second", 2, false);
+        assert!(!same_inventory(
+            &[first.clone(), first.clone()], &[first.clone(), second.clone()],
+        ));
+        assert!(same_inventory(
+            &[first.clone(), second.clone()], &[second, first],
+        ));
+    }
+
+    #[test]
+    fn verified_manual_recovery_retires_only_its_failure_warning_without_repeating_it() {
+        let mut engine = HdrController::new(MockDisplay::new(vec![monitor("chosen", 1, false)]));
+        let mut denied = Authority::default();
+        denied.allowed.set(false);
+        let outcomes = engine.manual_set(&chosen(), true, &mut denied);
+        assert_eq!(outcomes[0].failure, Some(FailureKind::AuthorityDenied));
+        let warning = engine.warning().unwrap();
+        assert_eq!(warning.matches("gate closed").count(), 1);
+        engine.manual_set(&chosen(), true, &mut denied);
+        assert_eq!(engine.warning().as_deref(), Some(warning.as_str()));
+        // Verifying the opposite state is also an explicit recovery of this display.
+        let recovered = engine.manual_set(&chosen(), false, &mut Authority::default());
+        assert_eq!(recovered[0].outcome, OutcomeKind::AlreadyInDesiredState);
+        assert!(engine.warning().is_none());
+        assert!(engine.backend.writes.is_empty());
+    }
+
+    #[test]
+    fn manual_success_preserves_other_display_failures_persistent_issues_and_uncertainty() {
+        let mut engine = active(
+            vec![monitor("chosen", 1, false), monitor("other", 2, false)], chosen(),
+        );
+        engine.backend.update_state = false;
+        engine.enable_activation(&mut Authority::default());
+        assert!(engine.has_uncertainty());
+        engine.warn("Unresolved controller conflict");
+        let other = TargetMonitor::Monitor {
+            device_path: "other".into(), display_name: "Other".into(),
+        };
+        let mut denied = Authority::default();
+        denied.allowed.set(false);
+        engine.manual_set(&chosen(), true, &mut denied);
+        engine.manual_set(&other, true, &mut denied);
+        let recovered = engine.manual_set(&other, false, &mut Authority::default());
+        assert!(recovered[0].is_verified());
+        let warnings = engine.warning().unwrap();
+        assert!(warnings.contains("Unresolved controller conflict"));
+        assert!(warnings.contains("gate closed"), "the other failed scope remains unresolved");
+        assert!(warnings.contains("HDR may have changed"));
+        assert!(engine.has_uncertainty());
+        engine.manual_set(&chosen(), false, &mut Authority::default());
+        assert!(!engine.has_uncertainty());
+        assert_eq!(engine.warning().as_deref(), Some("Unresolved controller conflict"));
+    }
+
+    #[test]
+    fn failed_scope_selection_and_enumeration_retire_only_after_verified_scope_recovery() {
+        let mut engine = HdrController::new(MockDisplay::new(Vec::new()));
+        engine.manual_set(&chosen(), true, &mut Authority::default());
+        assert!(engine.warning().is_some());
+        engine.backend.monitors.push(monitor("chosen", 1, false));
+        engine.manual_set(&chosen(), false, &mut Authority::default());
+        assert!(engine.warning().is_none());
+
+        engine.backend.enumeration_error = Some("Inventory unavailable".into());
+        engine.manual_set(&TargetMonitor::All, true, &mut Authority::default());
+        assert!(engine.warning().unwrap().contains("Inventory unavailable"));
+        engine.backend.enumeration_error = None;
+        engine.manual_set(&chosen(), false, &mut Authority::default());
+        assert!(engine.warning().is_some(), "a single-display request is not All recovery");
+        engine.manual_set(&TargetMonitor::All, false, &mut Authority::default());
+        assert!(engine.warning().is_none());
     }
 
     #[test]

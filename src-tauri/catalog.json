@@ -730,6 +730,7 @@
   },
   {
     "name": "Baldur's Gate 3",
+    "name_aliases": ["Baldur's Gate 3 (DX11)"],
     "exe_name": "bg3.exe",
     "hdr_type": "native",
     "support_tier": "native",
@@ -739,15 +740,6 @@
       "bg3_dx11.exe",
       "baldursgate3.exe"
     ]
-  },
-  {
-    "name": "Baldur's Gate 3 (DX11)",
-    "exe_name": "bg3_dx11.exe",
-    "hdr_type": "native",
-    "support_tier": "native",
-    "notes": "Nativní HDR",
-    "steam_id": null,
-    "alternate_exes": []
   },
   {
     "name": "Banishers: Ghosts of New Eden",
@@ -1853,6 +1845,7 @@
   },
   {
     "name": "Dead Space (2023)",
+    "name_aliases": ["Dead Space Remake"],
     "exe_name": "deadspace.exe",
     "hdr_type": "native",
     "support_tier": "native",
@@ -1861,15 +1854,6 @@
     "alternate_exes": [
       "deadspace2023.exe"
     ]
-  },
-  {
-    "name": "Dead Space Remake",
-    "exe_name": "deadspace.exe",
-    "hdr_type": "native",
-    "support_tier": "native",
-    "notes": "Nativní podpora",
-    "steam_id": null,
-    "alternate_exes": []
   },
   {
     "name": "Death Stranding",
@@ -6608,6 +6592,7 @@
   },
   {
     "name": "Resident Evil 2 (2019)",
+    "name_aliases": ["Resident Evil 2 Remake"],
     "exe_name": "re2.exe",
     "hdr_type": "native",
     "support_tier": "native",
@@ -6618,16 +6603,8 @@
     ]
   },
   {
-    "name": "Resident Evil 2 Remake",
-    "exe_name": "re2.exe",
-    "hdr_type": "native",
-    "support_tier": "native",
-    "notes": "RE Engine nativní HDR",
-    "steam_id": null,
-    "alternate_exes": []
-  },
-  {
     "name": "Resident Evil 3 (2020)",
+    "name_aliases": ["Resident Evil 3 Remake"],
     "exe_name": "re3.exe",
     "hdr_type": "native",
     "support_tier": "native",
@@ -6638,16 +6615,8 @@
     ]
   },
   {
-    "name": "Resident Evil 3 Remake",
-    "exe_name": "re3.exe",
-    "hdr_type": "native",
-    "support_tier": "native",
-    "notes": "RE Engine nativní HDR",
-    "steam_id": null,
-    "alternate_exes": []
-  },
-  {
     "name": "Resident Evil 4 (2023)",
+    "name_aliases": ["Resident Evil 4 Remake"],
     "exe_name": "re4.exe",
     "hdr_type": "native",
     "support_tier": "native",
@@ -6656,15 +6625,6 @@
     "alternate_exes": [
       "residentevil42023.exe"
     ]
-  },
-  {
-    "name": "Resident Evil 4 Remake",
-    "exe_name": "re4.exe",
-    "hdr_type": "native",
-    "support_tier": "native",
-    "notes": "RE Engine nativní HDR",
-    "steam_id": null,
-    "alternate_exes": []
   },
   {
     "name": "Resident Evil 7: Biohazard",

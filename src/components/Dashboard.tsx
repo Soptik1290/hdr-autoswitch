@@ -1,5 +1,5 @@
 import React, { useRef, useState } from 'react';
-import { MonitorInfo, HdrStatePayload, ActivityLogEntry, RecentGameSession, TargetMonitor, ManualSetResult } from '../types';
+import { MonitorInfo, HdrStatePayload, ActivityLogEntry, RecentGameSession, TargetMonitor, ManualSetResult, ManualRequestOrigin, ManualControlError } from '../types';
 import { invoke } from '@tauri-apps/api/core';
 import { activityMessage, describeHdrScope, telemetryTime } from '../telemetryText';
 import { manualScopeAvailable, monitorMode, monitorReady, scopeVisuals } from '../displayState';
@@ -30,7 +30,9 @@ interface DashboardProps {
   onManualToggle: () => void;
   onNavigateToApps: () => void;
   controlAvailable: boolean;
-  onControlError: (error: string | null) => void;
+  onControlError: (error: ManualControlError) => void;
+  onManualResult: (result: ManualSetResult) => void;
+  captureManualOrigin: (scope: TargetMonitor) => ManualRequestOrigin;
   isDark: boolean;
 }
 
@@ -45,6 +47,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
   onNavigateToApps,
   controlAvailable,
   onControlError,
+  onManualResult,
+  captureManualOrigin,
   isDark,
 }) => {
   const { t, lang } = useI18n();
@@ -53,26 +57,19 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   const handleSet = async (scope: TargetMonitor, enable: boolean) => {
     if (manualPending.current) return;
+    const origin = captureManualOrigin(scope);
     if (!controlAvailable || !manualScopeAvailable(scope, monitors)) {
-      onControlError(status.manual_control.status === 'blocked'
-        ? status.manual_control.reason : t.configManualUnavailable);
+      onControlError({ ...origin, message: status.manual_control.status === 'blocked'
+        ? status.manual_control.reason : t.configManualUnavailable });
       return;
     }
     manualPending.current = true;
     setToggling(true);
-    onControlError(null);
     try {
-      const result = await invoke<ManualSetResult>('set_hdr', { scope, enable });
-      const failures = result.outcomes.filter((item) => item.outcome === 'failed' || item.outcome === 'outcome_unknown');
-      if (result.outcomes.length === 0) {
-        onControlError(t.configManualUnavailable);
-      } else if (failures.length > 0) {
-        onControlError(failures.map((item) =>
-          `${item.display_name ?? item.device_path ?? t.settingsAllMonitors}: ${item.message ?? item.outcome}`
-        ).join('; '));
-      }
+      const result = await invoke<ManualSetResult>('set_hdr', { scope, enable, request: origin.request });
+      onManualResult(result);
     } catch (err) {
-      onControlError(String(err));
+      onControlError({ ...origin, message: String(err) });
     } finally {
       onManualToggle();
       manualPending.current = false;
@@ -82,7 +79,12 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   const handleSetMonitor = (monitor: MonitorInfo, enable: boolean) => {
     if (!monitorReady(monitor)) {
-      onControlError(t.configMonitorIdentityError);
+      onControlError({
+        ...captureManualOrigin(monitor.device_path
+          ? { kind: 'monitor', device_path: monitor.device_path, display_name: monitor.name }
+          : { kind: 'needs_confirmation', legacy_runtime_id: monitor.id }),
+        message: t.configMonitorIdentityError,
+      });
       return;
     }
     void handleSet({ kind: 'monitor', device_path: monitor.device_path, display_name: monitor.name }, enable);

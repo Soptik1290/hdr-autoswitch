@@ -20,11 +20,7 @@ const uninstaller = "uninstall.exe";
 const resource = "assets\\catalog.json";
 const sidecar = "support.exe";
 const cleanupFiles = [main, uninstaller];
-const metadataCommands = [
-  'DeleteRegKey HKCU "${UNINSTKEY}"',
-  'DeleteRegValue HKCU "${PRODUCTKEY}" ""',
-  'DeleteRegKey /ifempty HKCU "${PRODUCTKEY}"',
-];
+const checkedRetirement = uninstall.includes("--hdr-installer-retirement-commit nsis");
 
 function macro(name) {
   const match = template.match(new RegExp(`!macro ${name} [^\\r\\n]+\\r?\\n([\\s\\S]*?)!macroend`));
@@ -96,6 +92,8 @@ function simulate({
   recoveryMoveFails = false,
   preflightFails = false,
   selfCopy = true,
+  retirementFailure,
+  registryRollbackFails = false,
 } = {}) {
   const files = new Map(initialFiles ?? [
     [main, "original main bytes"],
@@ -119,12 +117,15 @@ function simulate({
   let metadata = true;
   let shortcuts = true;
   let exitCode = 0;
+  let retirementStarted = false;
+  let productPath = true;
+  let uninstallRegistration = true;
 
   function result() {
     return {
       files, initial, recovery, restoreStaging, restoreDirectoryOwned,
       temporaryVolume, restoreVolume, installationVolume,
-      events, metadata, shortcuts, exitCode,
+      events, metadata, shortcuts, exitCode, productPath, uninstallRegistration,
     };
   }
 
@@ -152,6 +153,14 @@ function simulate({
         }
       }
     }
+    if (retirementStarted) {
+      events.push("restore-registration");
+      if (!registryRollbackFails && cleanupFiles.every(name => files.get(name) === recovery.get(name))) {
+        productPath = true;
+        uninstallRegistration = true;
+        metadata = true;
+      }
+    }
     return result();
   }
 
@@ -162,6 +171,7 @@ function simulate({
     if (backupFailure === name) return fail();
     recovery.set(name, files.get(name));
   }
+  if (checkedRetirement) events.push("prepare-registration-receipt");
   for (const removal of removals) {
     const name = removal.path;
     events.push(`delete:${name}`);
@@ -171,6 +181,18 @@ function simulate({
       return fail();
     }
   }
+  if (checkedRetirement) {
+    retirementStarted = true;
+    events.push("retire-registration");
+    for (const step of ["product-delete", "product-readback", "uninstall-delete", "uninstall-readback"]) {
+      events.push(step);
+      if (retirementFailure === step) return fail();
+      if (step === "product-delete") productPath = false;
+      if (step === "uninstall-delete") uninstallRegistration = false;
+      metadata = productPath && uninstallRegistration;
+    }
+    metadata = false;
+  }
   if (backedUp.length) {
     events.push("move-recovery-to-private-plugin-directory");
     if (recoveryMoveFails) return fail();
@@ -178,7 +200,7 @@ function simulate({
   }
   events.push("remove-owned-shortcuts");
   shortcuts = false;
-  events.push("remove-registration");
+  if (!checkedRetirement) events.push("remove-registration");
   metadata = false;
   return result();
 }
@@ -228,14 +250,16 @@ test("recovery is verified before deletion and detached from automatic failure c
     '!insertmacro HdrCreateUninstallDirectory $HdrUninstallRecovery "$TEMP" "hdr-uninstall-recovery" hdr_uninstall_prepare_failed',
     '!insertmacro HdrBackupUninstallFile "${MAINBINARYNAME}.exe"',
     '!insertmacro HdrBackupUninstallFile "uninstall.exe"',
+    "--hdr-installer-retirement-prepare nsis",
     '{{#each resources}}',
     '{{#each binaries}}',
     '!insertmacro HdrDeleteUninstallPayload "$INSTDIR\\${MAINBINARYNAME}.exe"',
     '!insertmacro HdrDeleteUninstallPayload "$INSTDIR\\uninstall.exe"',
+    "--hdr-installer-retirement-commit nsis",
+    "Goto hdr_uninstall_failed",
     'Rename "$HdrUninstallRecovery" "$PLUGINSDIR\\hdr-uninstall-complete"',
     "Goto hdr_uninstall_failed",
     "!insertmacro IsShortcutTarget",
-    ...metadataCommands,
     "Goto hdr_uninstall_done",
     "hdr_uninstall_failed:",
     "hdr_uninstall_done:",
@@ -245,6 +269,72 @@ test("recovery is verified before deletion and detached from automatic failure c
     "${If} $0 == 0",
     "Goto hdr_uninstall_prepare_failed",
   ]);
+});
+
+test("registry retirement is checked after payload deletion and before releasing recovery", () => {
+  assert.ok(checkedRetirement, "missing checked registry retirement after payload deletion");
+  assert.doesNotMatch(uninstall, /DeleteReg(?:Key|Value)/);
+  const commit = uninstall.slice(uninstall.indexOf("--hdr-installer-retirement-commit nsis"));
+  ordered(commit, [
+    "${If} ${Errors}", "StrCpy $0 1", "${If} $0 != 0",
+    "Goto hdr_uninstall_failed",
+    'Rename "$HdrUninstallRecovery" "$PLUGINSDIR\\hdr-uninstall-complete"',
+  ]);
+  ordered(uninstall.slice(uninstall.indexOf("hdr_uninstall_failed:")), [
+    '!insertmacro HdrRestoreUninstallFile "${MAINBINARYNAME}.exe"',
+    '!insertmacro HdrRestoreUninstallFile "uninstall.exe"',
+    "--hdr-installer-retirement-restore nsis",
+    "SetErrorLevel 1",
+    "Quit",
+  ]);
+  for (const fragment of [
+    "fn retire_nsis_registration(", "fn restore_nsis_registration(",
+    "fn nsis_retirement(", "RegDeleteKeyExW", "RegEnumValueW",
+    "create_new(true)", "sync_all()", "retirement_receipt_path",
+  ]) assert.ok(helper.includes(fragment), `missing retirement implementation: ${fragment}`);
+});
+
+test("registry retirement compares exact receipt values and checks every native readback", () => {
+  const retire = helper.slice(
+    helper.indexOf("fn retire_nsis_registration("),
+    helper.indexOf("fn restore_nsis_registration("),
+  );
+  ordered(retire, [
+    "registry.read(RetirementKey::Uninstall, entry.view)",
+    "registry.read(RetirementKey::Product, entry.view)",
+    "registry.delete_product_path(entry.view)?",
+    'return Err("Product-path retirement failed readback"',
+    "registry.read(RetirementKey::Uninstall, entry.view)",
+    "registry.delete_uninstall(entry.view)?",
+    'return Err("Uninstall registration retirement failed readback"',
+    'return Err("Installation metadata retirement was not confirmed"',
+  ]);
+  assert.ok(helper.includes("entry.uninstall.get(name) != Some(value)"));
+  assert.ok(helper.includes("if !actual.contains_key(name)"));
+  assert.ok(helper.includes("original.is_empty() || original != backup"));
+  assert.match(helper, /"--hdr-installer-retirement-restore" => \{\s*verify_recovery_pair\(target, recovery\)\?;\s*restore_nsis_registration/);
+  assert.match(helper, /write_recovery_artifact\(&recovery\.join\("RECOVERY\.txt"\)/);
+  assert.match(uninstall, /Installation metadata recovery was NOT confirmed/);
+  assert.match(uninstall, /recovery-only command in RECOVERY\.txt/);
+  for (const regression of [
+    "nsis_retirement_checks_deletion_and_readback_before_success",
+    "nsis_retirement_preserves_unrelated_product_metadata",
+    "nsis_retirement_precheck_refuses_concurrent_metadata_without_writes",
+    "nsis_retirement_rollback_restores_exact_bytes_after_recovery_cleanup_failure",
+    "nsis_retirement_rollback_refuses_unknown_replacements",
+    "nsis_retirement_rollback_failure_is_retryable_with_the_same_receipt",
+    "nsis_retirement_partial_metadata_restoration_is_retryable_without_overwriting",
+    "nsis_retirement_and_rollback_support_aliased_registry_views",
+    "nsis_retirement_checks_and_restores_independent_registry_views",
+  ]) assert.ok(helper.includes(`fn ${regression}(`), `missing regression: ${regression}`);
+});
+
+test("shared registry views permit checked absence after the complete precheck", () => {
+  const retire = helper.slice(
+    helper.indexOf("fn retire_nsis_registration("),
+    helper.indexOf("fn restore_nsis_registration("),
+  );
+  assert.match(retire, /if let Some\(actual\) = registry\.read\(RetirementKey::Uninstall, entry\.view\)\? \{\s*if actual != entry\.uninstall \{[\s\S]*?registry\.delete_uninstall\(entry\.view\)\?;\s*\}\s*if registry\.read\(RetirementKey::Uninstall, entry\.view\)\?\.is_some\(\)/);
 });
 
 test("private directory creation refuses reuse before taking ownership", () => {
@@ -361,14 +451,76 @@ test("normal success removes every payload before metadata, but preserves user f
     "preflight",
     `backup:${main}`,
     `backup:${uninstaller}`,
+    "prepare-registration-receipt",
     `delete:${resource}`,
     `delete:${sidecar}`,
     `delete:${main}`,
     `delete:${uninstaller}`,
+    "retire-registration",
+    "product-delete",
+    "product-readback",
+    "uninstall-delete",
+    "uninstall-readback",
     "move-recovery-to-private-plugin-directory",
     "remove-owned-shortcuts",
-    "remove-registration",
   ]);
+});
+
+for (const failure of ["product-delete", "product-readback", "uninstall-delete", "uninstall-readback"]) {
+  test(`post-payload ${failure} failure restores metadata and cleanup executables`, () => {
+    const result = simulate({ retirementFailure: failure });
+    preserved(result);
+    assert.equal(result.productPath, true);
+    assert.equal(result.uninstallRegistration, true);
+    assert.ok(result.events.includes(`delete:${uninstaller}`));
+    assert.ok(result.events.includes("restore-registration"));
+    assert.ok(!result.events.includes("move-recovery-to-private-plugin-directory"));
+    for (const name of cleanupFiles) {
+      assert.equal(result.files.get(name), result.initial.get(name));
+      assert.equal(result.recovery.get(name), result.initial.get(name));
+    }
+  });
+}
+
+test("registry rollback refusal retains a usable recovery helper and explicit failure", () => {
+  const result = simulate({
+    retirementFailure: "uninstall-readback", registryRollbackFails: true,
+  });
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.metadata, false);
+  assert.ok(result.events.includes("restore-registration"));
+  assert.equal(result.productPath, false);
+  assert.equal(result.uninstallRegistration, false);
+  for (const name of cleanupFiles) {
+    assert.equal(result.files.get(name), result.initial.get(name));
+    assert.equal(result.recovery.get(name), result.initial.get(name));
+  }
+  assert.ok(!result.events.includes("move-recovery-to-private-plugin-directory"));
+});
+
+test("post-retirement recovery restores both executable paths before registry ownership", () => {
+  const result = simulate({ recoveryMoveFails: true });
+  preserved(result);
+  const registration = result.events.indexOf("restore-registration");
+  for (const name of cleanupFiles) {
+    assert.ok(result.events.indexOf(`restore:${name}`) < registration);
+  }
+});
+
+test("registry recovery refuses an incomplete or unrelated executable replacement", () => {
+  for (const failures of [
+    { restoreCopyFailure: [main] },
+    { replacementOnFailure: main },
+    { restoreDirectoryFailure: true },
+  ]) {
+    const result = simulate({ recoveryMoveFails: true, ...failures });
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.metadata, false);
+    assert.equal(result.shortcuts, true);
+    for (const name of cleanupFiles) {
+      assert.equal(result.recovery.get(name), result.initial.get(name));
+    }
+  }
 });
 
 for (const name of cleanupFiles) {
@@ -509,6 +661,9 @@ test("the contract records partial-removal recovery and the live qualification g
   assert.match(contract.integration.nsisUninstallRemoval ?? "", /metadata/i);
   assert.match(contract.integration.nsisUninstallRemoval ?? "", /missing/i);
   assert.match(contract.integration.nsisUninstallRemoval ?? "", /installation volume/i);
+  assert.match(contract.integration.nsisRegistryRetirement ?? "", /receipt/i);
+  assert.match(contract.integration.nsisRegistryRetirement ?? "", /readback/i);
+  assert.match(contract.integration.nsisRegistryRetirement ?? "", /rollback/i);
   assert.ok(contract.releaseValidationGates.some(gate =>
     /NSIS uninstall/.test(gate) && /payload/.test(gate) && /recovery/.test(gate)));
 });

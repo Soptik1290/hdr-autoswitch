@@ -5,6 +5,8 @@
 //! No function in this module sends WM_CLOSE or terminates another process.
 
 use std::sync::{Mutex, MutexGuard};
+use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
 
 const PRODUCT_NAME: &str = "HDR Auto-Switch";
 const PUBLISHER: &str = "soptik";
@@ -97,13 +99,16 @@ pub fn autostart_enabled() -> Result<bool, String> {
 /// config stores, controller locks, windows, hooks, or actors. `Some(code)` means
 /// the caller must exit with that code and must not initialize the application.
 ///
-/// Official installers embed the new executable solely as this preflight helper.
+/// Official installers use the executable only in these helper modes, including
+/// retained NSIS registry retirement/recovery after payload deletion.
 /// Full-UI installs offer Retry/Cancel; unattended installs fail instead of killing
 /// processes. A preflight is not perpetual exclusion of later legacy launches.
 pub fn installer_command() -> Option<i32> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let command = args.first()?.to_str()?;
-    if command != "--hdr-installer-preflight" && command != "--hdr-installer-uninstall" {
+    if !matches!(command, "--hdr-installer-preflight" | "--hdr-installer-uninstall"
+        | "--hdr-installer-retirement-prepare" | "--hdr-installer-retirement-commit"
+        | "--hdr-installer-retirement-restore") {
         return None;
     }
     let result = if args.len() != 4 {
@@ -112,6 +117,10 @@ pub fn installer_command() -> Option<i32> {
         let format = args[1].to_str().and_then(InstallerKind::parse);
         let full_ui = args[3].to_str() == Some("5");
         match format {
+            Some(InstallerKind::Nsis) if command.starts_with("--hdr-installer-retirement-") =>
+                platform::nsis_retirement(command, std::path::Path::new(&args[2])),
+            Some(_) if command.starts_with("--hdr-installer-retirement-") =>
+                Err("Registry retirement is only supported for the owned NSIS installation".into()),
             Some(format) => platform::installer_handoff(
                 format,
                 std::path::Path::new(&args[2]),
@@ -146,10 +155,137 @@ impl InstallerKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct RegistryValue {
     kind: u32,
     bytes: Vec<u8>,
+}
+
+type RegistryValues = BTreeMap<String, RegistryValue>;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NsisRegistrationSnapshot {
+    view: u32,
+    uninstall: RegistryValues,
+    product_path: RegistryValue,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NsisRetirementReceipt {
+    schema: u32,
+    target: String,
+    registrations: Vec<NsisRegistrationSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum RetirementKey {
+    Uninstall,
+    Product,
+}
+
+trait RetirementRegistry {
+    fn read(&mut self, key: RetirementKey, view: u32) -> Result<Option<RegistryValues>, String>;
+    fn delete_uninstall(&mut self, view: u32) -> Result<(), String>;
+    fn delete_product_path(&mut self, view: u32) -> Result<(), String>;
+    fn write(&mut self, key: RetirementKey, view: u32, name: &str, value: &RegistryValue)
+        -> Result<(), String>;
+}
+
+fn product_path(values: &Option<RegistryValues>) -> Option<&RegistryValue> {
+    values.as_ref().and_then(|values| values.get(""))
+}
+
+fn retire_nsis_registration(
+    registry: &mut impl RetirementRegistry,
+    receipt: &NsisRetirementReceipt,
+) -> Result<(), String> {
+    // Precheck every view before any edit. The receipt was captured while both
+    // cleanup executables still existed; their later absence is not authority.
+    for entry in &receipt.registrations {
+        if registry.read(RetirementKey::Uninstall, entry.view)?.as_ref() != Some(&entry.uninstall)
+            || product_path(&registry.read(RetirementKey::Product, entry.view)?)
+                != Some(&entry.product_path)
+        {
+            return Err("Installation metadata changed after recovery preparation; retirement refused".into());
+        }
+    }
+    for entry in &receipt.registrations {
+        if product_path(&registry.read(RetirementKey::Product, entry.view)?)
+            .is_some_and(|value| value != &entry.product_path)
+        {
+            return Err("Product path changed before retirement".into());
+        }
+        registry.delete_product_path(entry.view)?;
+        if product_path(&registry.read(RetirementKey::Product, entry.view)?).is_some() {
+            return Err("Product-path retirement failed readback".into());
+        }
+        // HKCU registry views may alias. After the all-view precheck, a prior
+        // deletion can legitimately make this view absent; read errors cannot.
+        if let Some(actual) = registry.read(RetirementKey::Uninstall, entry.view)? {
+            if actual != entry.uninstall {
+                return Err("Uninstall registration changed before retirement".into());
+            }
+            registry.delete_uninstall(entry.view)?;
+        }
+        if registry.read(RetirementKey::Uninstall, entry.view)?.is_some() {
+            return Err("Uninstall registration retirement failed readback".into());
+        }
+    }
+    for entry in &receipt.registrations {
+        if registry.read(RetirementKey::Uninstall, entry.view)?.is_some()
+            || product_path(&registry.read(RetirementKey::Product, entry.view)?).is_some()
+        {
+            return Err("Installation metadata retirement was not confirmed".into());
+        }
+    }
+    Ok(())
+}
+
+fn restore_nsis_registration(
+    registry: &mut impl RetirementRegistry,
+    receipt: &NsisRetirementReceipt,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for entry in &receipt.registrations {
+        let restore = (|| {
+            if product_path(&registry.read(RetirementKey::Product, entry.view)?)
+                .is_some_and(|value| value != &entry.product_path)
+            {
+                return Err("Product path has a concurrent replacement; recovery refused".into());
+            }
+            for (name, expected) in &entry.uninstall {
+                let actual = registry.read(RetirementKey::Uninstall, entry.view)?.unwrap_or_default();
+                // Allow our own incomplete restoration to be retried, but never
+                // overwrite even one conflicting or newly added registry value.
+                if actual.iter().any(|(name, value)| entry.uninstall.get(name) != Some(value)) {
+                    return Err("Uninstall metadata has a concurrent replacement; recovery refused".into());
+                }
+                if !actual.contains_key(name) {
+                    registry.write(RetirementKey::Uninstall, entry.view, name, expected)?;
+                }
+            }
+            if registry.read(RetirementKey::Uninstall, entry.view)?.as_ref() != Some(&entry.uninstall) {
+                return Err("Uninstall metadata restoration failed readback".into());
+            }
+            let actual = registry.read(RetirementKey::Product, entry.view)?;
+            match product_path(&actual) {
+                Some(value) if value != &entry.product_path =>
+                    return Err("Product path has a concurrent replacement; recovery refused".into()),
+                Some(_) => {}
+                None => registry.write(RetirementKey::Product, entry.view, "", &entry.product_path)?,
+            }
+            if product_path(&registry.read(RetirementKey::Product, entry.view)?) != Some(&entry.product_path) {
+                return Err("Product-path restoration failed readback".into());
+            }
+            Ok::<_, String>(())
+        })();
+        if let Err(error) = restore {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
 }
 
 impl RegistryValue {
@@ -562,6 +698,10 @@ mod platform {
     ) -> Result<(), String> {
         Err("The HDR installer preflight requires Windows".to_owned())
     }
+
+    pub(super) fn nsis_retirement(_: &str, _: &Path) -> Result<(), String> {
+        Err("NSIS registration retirement requires Windows".into())
+    }
 }
 
 #[cfg(windows)]
@@ -569,6 +709,7 @@ mod platform {
     use super::*;
     use std::ffi::{OsStr, OsString};
     use std::mem::{size_of, size_of_val};
+    use std::io::Write;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::{Path, PathBuf};
     use windows::core::{PCWSTR, PWSTR};
@@ -590,8 +731,9 @@ mod platform {
         TH32CS_SNAPPROCESS,
     };
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
-        RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_32KEY,
+        RegCloseKey, RegCreateKeyExW, RegDeleteKeyExW, RegDeleteValueW, RegEnumKeyExW,
+        RegEnumValueW, RegOpenKeyExW, RegQueryValueExW,
+        RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_32KEY,
         KEY_WOW64_64KEY, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_VALUE_TYPE,
     };
     use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
@@ -673,6 +815,10 @@ mod platform {
 
     impl RegistryKey {
         fn open(path: &str, view: REG_SAM_FLAGS) -> Result<Option<Self>, String> {
+            Self::open_access(path, KEY_QUERY_VALUE | view)
+        }
+
+        fn open_access(path: &str, access: REG_SAM_FLAGS) -> Result<Option<Self>, String> {
             let path_w = wide(path);
             let mut handle = HKEY::default();
             let status = unsafe {
@@ -680,7 +826,7 @@ mod platform {
                     HKEY_CURRENT_USER,
                     PCWSTR(path_w.as_ptr()),
                     Some(0),
-                    KEY_QUERY_VALUE | view,
+                    access,
                     &mut handle,
                 )
             };
@@ -757,6 +903,242 @@ mod platform {
             self.read(name)?
                 .ok_or_else(|| format!("Installed product metadata is missing '{name}'"))?
                 .as_string()
+        }
+
+        fn values(&self, reject_subkeys: bool) -> Result<RegistryValues, String> {
+            if reject_subkeys {
+                let mut name = [0u16; 256];
+                let mut size = name.len() as u32;
+                let status = unsafe {
+                    RegEnumKeyExW(self.0, 0, Some(PWSTR(name.as_mut_ptr())), &mut size,
+                        None, None, None, None)
+                };
+                if status != ERROR_NO_MORE_ITEMS {
+                    return Err(format!("Uninstall key has subkeys or cannot be inspected ({}); no recursive deletion is permitted", status.0));
+                }
+            }
+            let mut values = RegistryValues::new();
+            for index in 0..1024 {
+                let mut name = vec![0u16; 16_384];
+                let mut size = name.len() as u32;
+                let status = unsafe {
+                    RegEnumValueW(self.0, index, Some(PWSTR(name.as_mut_ptr())), &mut size,
+                        None, None, None, None)
+                };
+                if status == ERROR_NO_MORE_ITEMS {
+                    return Ok(values);
+                }
+                if status != ERROR_SUCCESS {
+                    return Err(format!("Cannot enumerate installation metadata: Windows error {}", status.0));
+                }
+                let name = String::from_utf16(&name[..size as usize])
+                    .map_err(|_| "Installation value name is not valid Unicode")?;
+                let value = self.read(&name)?.ok_or("Installation metadata changed while reading")?;
+                if values.insert(name, value).is_some() {
+                    return Err("Installation metadata changed while enumerating".into());
+                }
+            }
+            Err("Installation metadata exceeds the bounded recovery snapshot".into())
+        }
+    }
+
+    impl RetirementKey {
+        fn path(self) -> &'static str {
+            match self {
+                Self::Uninstall => NSIS_UNINSTALL,
+                Self::Product => PRODUCT_KEY,
+            }
+        }
+    }
+
+    struct NsisRetirementRegistry;
+
+    impl RetirementRegistry for NsisRetirementRegistry {
+        fn read(&mut self, key: RetirementKey, view: u32) -> Result<Option<RegistryValues>, String> {
+            let access = KEY_QUERY_VALUE | REG_SAM_FLAGS(view)
+                | if key == RetirementKey::Uninstall { KEY_ENUMERATE_SUB_KEYS } else { REG_SAM_FLAGS(0) };
+            RegistryKey::open_access(key.path(), access)?
+                .map(|handle| handle.values(key == RetirementKey::Uninstall)).transpose()
+        }
+
+        fn delete_uninstall(&mut self, view: u32) -> Result<(), String> {
+            let path = wide(NSIS_UNINSTALL);
+            let status = unsafe { RegDeleteKeyExW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), view, Some(0)) };
+            if status == ERROR_SUCCESS { Ok(()) }
+            else { Err(format!("Cannot retire uninstall registration: Windows error {}", status.0)) }
+        }
+
+        fn delete_product_path(&mut self, view: u32) -> Result<(), String> {
+            let Some(key) = RegistryKey::open_access(PRODUCT_KEY, KEY_SET_VALUE | REG_SAM_FLAGS(view))?
+            else { return Ok(()); };
+            let name = wide("");
+            let status = unsafe { RegDeleteValueW(key.0, PCWSTR(name.as_ptr())) };
+            // Product keys can be shared across registry views. The caller also
+            // requires explicit absence readback; denied queries never pass.
+            if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND { Ok(()) }
+            else { Err(format!("Cannot retire product path: Windows error {}", status.0)) }
+        }
+
+        fn write(&mut self, key: RetirementKey, view: u32, name: &str, value: &RegistryValue)
+            -> Result<(), String> {
+            let path = wide(key.path());
+            let name = wide(name);
+            let mut handle = HKEY::default();
+            let status = unsafe {
+                RegCreateKeyExW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), Some(0), None,
+                    REG_OPTION_NON_VOLATILE, KEY_QUERY_VALUE | KEY_SET_VALUE | REG_SAM_FLAGS(view),
+                    None, &mut handle, None)
+            };
+            if status != ERROR_SUCCESS {
+                return Err(format!("Cannot open metadata for recovery: Windows error {}", status.0));
+            }
+            let key = RegistryKey(handle);
+            let status = unsafe {
+                RegSetValueExW(key.0, PCWSTR(name.as_ptr()), Some(0), REG_VALUE_TYPE(value.kind),
+                    Some(&value.bytes))
+            };
+            if status == ERROR_SUCCESS { Ok(()) }
+            else { Err(format!("Cannot restore metadata: Windows error {}", status.0)) }
+        }
+    }
+
+    fn retirement_receipt_path() -> Result<PathBuf, String> {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        Ok(executable.parent().ok_or("Recovery executable has no parent directory")?
+            .join("hdr-uninstall-registration.json"))
+    }
+
+    fn write_recovery_artifact(path: &Path, bytes: &[u8]) -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(path).map_err(|error| format!("Cannot create recovery artifact: {error}"))?;
+        file.write_all(bytes).and_then(|()| file.sync_all())
+            .map_err(|error| format!("Cannot persist recovery artifact: {error}"))
+    }
+
+    fn cleanup_path_without_file(path: &Path) -> Result<PathBuf, String> {
+        if !path.is_absolute() {
+            return Err("Recovery target must be absolute".into());
+        }
+        let parent = path.parent().ok_or("Recovery target has no installation directory")?;
+        let name = path.file_name().ok_or("Recovery target has no filename")?;
+        Ok(canonical(parent)?.join(name))
+    }
+
+    fn validate_retirement_receipt(receipt: &NsisRetirementReceipt, target: &Path) -> Result<(), String> {
+        let target = cleanup_path_without_file(target)?;
+        if receipt.schema != 1 || !ordinal_eq(&target, &receipt.target)
+            || !target.file_name().is_some_and(|name| ordinal_eq(name, MAIN_BINARY))
+            || receipt.registrations.is_empty() || receipt.registrations.len() > 2
+        {
+            return Err("Invalid installation recovery receipt or target".into());
+        }
+        let mut views = std::collections::BTreeSet::new();
+        for entry in &receipt.registrations {
+            if ![KEY_WOW64_32KEY.0, KEY_WOW64_64KEY.0].contains(&entry.view) || !views.insert(entry.view) {
+                return Err("Invalid or duplicate recovery registry view".into());
+            }
+            let string = |name: &str| entry.uninstall.get(name)
+                .ok_or_else(|| format!("Recovery metadata is missing '{name}'"))?.as_string();
+            if string("DisplayName")? != PRODUCT_NAME || string("Publisher")? != PUBLISHER
+                || string("MainBinaryName")? != MAIN_BINARY
+            {
+                return Err("Recovery metadata does not identify this product".into());
+            }
+            let location = canonical(&unquote_path(&string("InstallLocation")?)?)?;
+            if !ordinal_eq(location.join(MAIN_BINARY), &target)
+                || !ordinal_eq(canonical(&unquote_path(&entry.product_path.as_string()?)?)?, &location)
+                || !ordinal_eq(cleanup_path_without_file(&unquote_path(&string("DisplayIcon")?)?)?, &target)
+                || !ordinal_eq(cleanup_path_without_file(&unquote_path(&string("UninstallString")?)?)?,
+                    location.join("uninstall.exe"))
+            {
+                return Err("Recovery metadata paths disagree with the original installation".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_recovery_pair(target: &Path, recovery: &Path) -> Result<(), String> {
+        let installation = target.parent().ok_or("Missing installation directory")?;
+        for name in [MAIN_BINARY, "uninstall.exe"] {
+            let original = std::fs::read(installation.join(name))
+                .map_err(|error| format!("Cannot verify restored {name}: {error}"))?;
+            let backup = std::fs::read(recovery.join(name))
+                .map_err(|error| format!("Cannot read recovery {name}: {error}"))?;
+            if original.is_empty() || original != backup {
+                return Err(format!("The existing {name} differs from the recovery copy; it will not be registered or overwritten"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn nsis_retirement(command: &str, target: &Path) -> Result<(), String> {
+        let _user = interactive_user()?;
+        let receipt_path = retirement_receipt_path()?;
+        let recovery = receipt_path.parent().ok_or("Missing recovery directory")?;
+        let executable = canonical(&std::env::current_exe().map_err(|error| error.to_string())?)?;
+        if ordinal_eq(&executable, cleanup_path_without_file(target)?) {
+            return Err("Registry retirement must run from the retained recovery helper".into());
+        }
+        let mut registry = NsisRetirementRegistry;
+        if command == "--hdr-installer-retirement-prepare" {
+            handoff_once(InstallerKind::Nsis, target, true)?;
+            verify_recovery_pair(target, recovery)?;
+            let mut receipt = NsisRetirementReceipt {
+                schema: 1,
+                target: cleanup_path_without_file(target)?.to_str()
+                    .ok_or("Recovery target is not valid Unicode")?.into(),
+                registrations: Vec::new(),
+            };
+            for view in [KEY_WOW64_64KEY.0, KEY_WOW64_32KEY.0] {
+                if let Some(uninstall) = registry.read(RetirementKey::Uninstall, view)? {
+                    let product = registry.read(RetirementKey::Product, view)?;
+                    receipt.registrations.push(NsisRegistrationSnapshot {
+                        view, uninstall,
+                        product_path: product_path(&product).ok_or("Missing owned product path")?.clone(),
+                    });
+                }
+            }
+            validate_retirement_receipt(&receipt, target)?;
+            let bytes = serde_json::to_vec(&receipt).map_err(|error| error.to_string())?;
+            if bytes.len() > 2_097_152 {
+                return Err("Recovery receipt exceeds its size limit".into());
+            }
+            write_recovery_artifact(&receipt_path, &bytes)?;
+            let instructions = format!(
+                "HDR Auto-Switch incomplete uninstall recovery\r\n\
+                 Do NOT launch the application: bundled resources may already be gone and startup may be disabled.\r\n\
+                 Keep this entire recovery directory, including both executables and hdr-uninstall-registration.json.\r\n\
+                 After closing locks, copy tauri-app.exe and uninstall.exe from this directory to {} ONLY where the original is missing. Never overwrite a conflicting file; do not use partial .restore files.\r\n\
+                 Resolve any registry access/conflict errors, then run the following recovery-only command from Command Prompt (cmd.exe) as the original signed-in user. It verifies complete cleanup executable bytes and restores only missing original registry values, without initializing the app, changing startup or terminating any process:\r\n\
+                 \"{}\" --hdr-installer-retirement-restore nsis \"{}\" 2\r\n\
+                 Only after that command succeeds, retry the restored uninstall.exe normally (without _?=). Keep these recovery files until uninstall succeeds.\r\n",
+                target.parent().unwrap().display(), executable.display(), target.display(),
+            );
+            write_recovery_artifact(&recovery.join("RECOVERY.txt"), instructions.as_bytes())?;
+            return Ok(());
+        }
+        let metadata = std::fs::metadata(&receipt_path).map_err(|error| error.to_string())?;
+        if metadata.len() > 2_097_152 {
+            return Err("Recovery receipt exceeds its size limit".into());
+        }
+        let bytes = std::fs::read(&receipt_path).map_err(|error| error.to_string())?;
+        let receipt: NsisRetirementReceipt = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Cannot read recovery receipt: {error}"))?;
+        validate_retirement_receipt(&receipt, target)?;
+        match command {
+            "--hdr-installer-retirement-commit" => {
+                for name in [MAIN_BINARY, "uninstall.exe"] {
+                    if target.parent().unwrap().join(name).try_exists().map_err(|error| error.to_string())? {
+                        return Err("Cleanup executables are still present; registry retirement refused".into());
+                    }
+                }
+                retire_nsis_registration(&mut registry, &receipt)
+            }
+            "--hdr-installer-retirement-restore" => {
+                verify_recovery_pair(target, recovery)?;
+                restore_nsis_registration(&mut registry, &receipt)
+            }
+            _ => Err("Unknown NSIS retirement command".into()),
         }
     }
 
@@ -1446,6 +1828,226 @@ mod tests {
     use std::collections::BTreeMap;
 
     const IMAGE: &str = r"C:\Users\tester\AppData\Local\HDR Auto-Switch\tauri-app.exe";
+
+    #[derive(Default)]
+    struct RetirementMemoryRegistry {
+        keys: BTreeMap<(RetirementKey, u32), RegistryValues>,
+        delete_failure: Option<RetirementKey>,
+        readback_failure: Option<RetirementKey>,
+        retain_on_delete: Option<RetirementKey>,
+        last_deleted: Option<RetirementKey>,
+        restore_failure: bool,
+        alias_views: bool,
+        writes: usize,
+    }
+
+    impl RetirementMemoryRegistry {
+        fn address(&self, key: RetirementKey, view: u32) -> (RetirementKey, u32) {
+            (key, if self.alias_views { 256 } else { view })
+        }
+
+        fn delete(&mut self, key: RetirementKey, view: u32) -> Result<(), String> {
+            if self.delete_failure == Some(key) {
+                self.delete_failure = None;
+                return Err("injected deletion access denial".into());
+            }
+            self.writes += 1;
+            self.last_deleted = Some(key);
+            let address = self.address(key, view);
+            if self.retain_on_delete != Some(key) {
+                if key == RetirementKey::Product {
+                    if let Some(values) = self.keys.get_mut(&address) {
+                        values.remove("");
+                    }
+                } else {
+                    self.keys.remove(&address);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl RetirementRegistry for RetirementMemoryRegistry {
+        fn read(&mut self, key: RetirementKey, view: u32) -> Result<Option<RegistryValues>, String> {
+            if self.last_deleted == Some(key) && self.readback_failure == Some(key) {
+                self.readback_failure = None;
+                return Err("injected readback access denial".into());
+            }
+            Ok(self.keys.get(&self.address(key, view)).cloned())
+        }
+
+        fn delete_uninstall(&mut self, view: u32) -> Result<(), String> {
+            self.delete(RetirementKey::Uninstall, view)
+        }
+
+        fn delete_product_path(&mut self, view: u32) -> Result<(), String> {
+            self.delete(RetirementKey::Product, view)
+        }
+
+        fn write(&mut self, key: RetirementKey, view: u32, name: &str, value: &RegistryValue)
+            -> Result<(), String> {
+            if self.restore_failure {
+                return Err("injected restoration access denial".into());
+            }
+            self.writes += 1;
+            let address = self.address(key, view);
+            self.keys.entry(address).or_default().insert(name.into(), value.clone());
+            Ok(())
+        }
+    }
+
+    fn retirement_fixture() -> (RetirementMemoryRegistry, NsisRetirementReceipt) {
+        let uninstall = BTreeMap::from([
+            ("DisplayName".into(), RegistryValue::string(PRODUCT_NAME)),
+            ("UninstallString".into(), RegistryValue::string(r#""C:\HDR\uninstall.exe""#)),
+            ("ExtraBinaryMetadata".into(), RegistryValue { kind: 3, bytes: vec![0, 255, 2, 0] }),
+        ]);
+        let product_path = RegistryValue::string(r"C:\HDR");
+        let product = BTreeMap::from([
+            ("".into(), product_path.clone()),
+            ("UnrelatedValue".into(), RegistryValue::string("leave me alone")),
+        ]);
+        let registry = RetirementMemoryRegistry {
+            keys: BTreeMap::from([
+                ((RetirementKey::Uninstall, 256), uninstall.clone()),
+                ((RetirementKey::Product, 256), product),
+            ]),
+            ..Default::default()
+        };
+        let receipt = NsisRetirementReceipt {
+            schema: 1, target: r"C:\HDR\tauri-app.exe".into(),
+            registrations: vec![NsisRegistrationSnapshot { view: 256, uninstall, product_path }],
+        };
+        (registry, receipt)
+    }
+
+    #[test]
+    fn nsis_retirement_checks_deletion_and_readback_before_success() {
+        for key in [RetirementKey::Product, RetirementKey::Uninstall] {
+            for failure in ["delete", "readback", "still-present"] {
+                let (mut registry, receipt) = retirement_fixture();
+                let before = registry.keys.clone();
+                match failure {
+                    "delete" => registry.delete_failure = Some(key),
+                    "readback" => registry.readback_failure = Some(key),
+                    _ => registry.retain_on_delete = Some(key),
+                }
+                assert!(retire_nsis_registration(&mut registry, &receipt).is_err(), "{key:?}: {failure}");
+                restore_nsis_registration(&mut registry, &receipt).unwrap();
+                assert_eq!(registry.keys, before, "{key:?}: {failure}");
+            }
+        }
+    }
+
+    #[test]
+    fn nsis_retirement_preserves_unrelated_product_metadata() {
+        let (mut registry, receipt) = retirement_fixture();
+        retire_nsis_registration(&mut registry, &receipt).unwrap();
+        assert!(!registry.keys.contains_key(&(RetirementKey::Uninstall, 256)));
+        assert_eq!(registry.keys[&(RetirementKey::Product, 256)],
+            BTreeMap::from([("UnrelatedValue".into(), RegistryValue::string("leave me alone"))]));
+    }
+
+    #[test]
+    fn nsis_retirement_precheck_refuses_concurrent_metadata_without_writes() {
+        for key in [RetirementKey::Uninstall, RetirementKey::Product] {
+            let (mut registry, receipt) = retirement_fixture();
+            let name = if key == RetirementKey::Product { "" } else { "DisplayName" };
+            registry.keys.get_mut(&(key, 256)).unwrap()
+                .insert(name.into(), RegistryValue::string("another owner"));
+            let before = registry.keys.clone();
+            assert!(retire_nsis_registration(&mut registry, &receipt).is_err());
+            assert_eq!(registry.keys, before);
+            assert_eq!(registry.writes, 0);
+        }
+    }
+
+    #[test]
+    fn nsis_retirement_rollback_restores_exact_bytes_after_recovery_cleanup_failure() {
+        let (mut registry, receipt) = retirement_fixture();
+        let before = registry.keys.clone();
+        retire_nsis_registration(&mut registry, &receipt).unwrap();
+        restore_nsis_registration(&mut registry, &receipt).unwrap();
+        assert_eq!(registry.keys, before);
+    }
+
+    #[test]
+    fn nsis_retirement_rollback_refuses_unknown_replacements() {
+        let (mut registry, receipt) = retirement_fixture();
+        retire_nsis_registration(&mut registry, &receipt).unwrap();
+        registry.keys.insert((RetirementKey::Uninstall, 256),
+            BTreeMap::from([("NewOwner".into(), RegistryValue::string("unrelated"))]));
+        let before = registry.keys.clone();
+        assert!(restore_nsis_registration(&mut registry, &receipt).is_err());
+        assert_eq!(registry.keys, before);
+    }
+
+    #[test]
+    fn nsis_retirement_rollback_failure_is_retryable_with_the_same_receipt() {
+        let (mut registry, receipt) = retirement_fixture();
+        let before = registry.keys.clone();
+        retire_nsis_registration(&mut registry, &receipt).unwrap();
+        registry.restore_failure = true;
+        assert!(restore_nsis_registration(&mut registry, &receipt).is_err());
+        registry.restore_failure = false;
+        restore_nsis_registration(&mut registry, &receipt).unwrap();
+        assert_eq!(registry.keys, before);
+    }
+
+    #[test]
+    fn nsis_retirement_partial_metadata_restoration_is_retryable_without_overwriting() {
+        let (mut registry, receipt) = retirement_fixture();
+        let before = registry.keys.clone();
+        retire_nsis_registration(&mut registry, &receipt).unwrap();
+        registry.keys.insert((RetirementKey::Uninstall, 256), BTreeMap::from([
+            ("DisplayName".into(), RegistryValue::string(PRODUCT_NAME)),
+        ]));
+        restore_nsis_registration(&mut registry, &receipt).unwrap();
+        assert_eq!(registry.keys, before);
+    }
+
+    #[test]
+    fn nsis_retirement_and_rollback_support_aliased_registry_views() {
+        let (mut registry, mut receipt) = retirement_fixture();
+        registry.alias_views = true;
+        let mut second_view = receipt.registrations[0].clone();
+        second_view.view = 512;
+        receipt.registrations.push(second_view);
+        let before = registry.keys.clone();
+
+        retire_nsis_registration(&mut registry, &receipt).unwrap();
+        for view in [256, 512] {
+            assert!(registry.read(RetirementKey::Uninstall, view).unwrap().is_none());
+            assert!(product_path(&registry.read(RetirementKey::Product, view).unwrap()).is_none());
+        }
+        restore_nsis_registration(&mut registry, &receipt).unwrap();
+        assert_eq!(registry.keys, before);
+    }
+
+    #[test]
+    fn nsis_retirement_checks_and_restores_independent_registry_views() {
+        let (mut registry, mut receipt) = retirement_fixture();
+        let mut second_view = receipt.registrations[0].clone();
+        second_view.view = 512;
+        receipt.registrations.push(second_view);
+        for key in [RetirementKey::Uninstall, RetirementKey::Product] {
+            registry.keys.insert((key, 512), registry.keys[&(key, 256)].clone());
+        }
+        let before = registry.keys.clone();
+        registry.keys.get_mut(&(RetirementKey::Uninstall, 512)).unwrap()
+            .insert("DisplayName".into(), RegistryValue::string("different owner"));
+        assert!(retire_nsis_registration(&mut registry, &receipt).is_err());
+        assert_eq!(registry.writes, 0, "all independent views must pass before any mutation");
+
+        registry.keys = before.clone();
+        retire_nsis_registration(&mut registry, &receipt).unwrap();
+        for view in [256, 512] {
+            assert!(registry.read(RetirementKey::Uninstall, view).unwrap().is_none());
+            assert!(product_path(&registry.read(RetirementKey::Product, view).unwrap()).is_none());
+        }
+        restore_nsis_registration(&mut registry, &receipt).unwrap();
+        assert_eq!(registry.keys, before);
+    }
 
     fn registration(command: &str, owned: bool, approved: bool) -> StartupRegistration {
         StartupRegistration {

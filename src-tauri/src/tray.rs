@@ -1,7 +1,7 @@
 use crate::{
     config::TargetMonitor,
     display::{ScopeHdrState, TargetStatus},
-    monitor_hook::{HdrStatePayload, ManualControl, ManualSetResult},
+    monitor_hook::{HdrStatePayload, ManualControl, ManualRequestIdentity, ManualSetResult},
     show_main_window, AppState,
 };
 use std::sync::{
@@ -24,6 +24,13 @@ struct TrayLabels {
 }
 
 type PresentationAction = Box<dyn FnOnce() + Send>;
+
+#[derive(Clone, serde::Serialize)]
+struct ManualControlError {
+    scope: TargetMonitor,
+    request: ManualRequestIdentity,
+    message: String,
+}
 
 #[derive(Default)]
 struct ManualPresentation {
@@ -273,7 +280,7 @@ fn manual_enabled(status: Option<&HdrStatePayload>) -> bool {
     })
 }
 
-fn manual_result_error(result: Result<ManualSetResult, String>) -> Option<String> {
+fn manual_result_error(result: &Result<ManualSetResult, String>) -> Option<String> {
     match result {
         Ok(result) => {
             let errors: Vec<String> = result.outcomes.iter()
@@ -289,7 +296,7 @@ fn manual_result_error(result: Result<ManualSetResult, String>) -> Option<String
                 None
             }
         }
-        Err(error) => Some(error),
+        Err(error) => Some(error.clone()),
     }
 }
 
@@ -297,10 +304,10 @@ fn dispatch_manual_result(
     presentation: Arc<ManualPresentation>,
     request: u64,
     result: Result<ManualSetResult, String>,
-    present: impl FnOnce(Option<String>) + Send + 'static,
+    present: impl FnOnce(Result<ManualSetResult, String>) + Send + 'static,
     schedule: impl FnOnce(PresentationAction) -> Result<(), String>,
 ) -> Result<(), String> {
-    let error = manual_result_error(result);
+    let error = manual_result_error(&result);
     if let Some(error) = &error {
         eprintln!("Tray HDR request failed: {error}");
     }
@@ -310,7 +317,7 @@ fn dispatch_manual_result(
     schedule(Box::new(move || {
         // A newer click may arrive after this UI callback was queued.
         if presentation.is_current(request) {
-            present(error);
+            present(result);
         }
     }))
 }
@@ -319,6 +326,7 @@ fn report_manual_result(
     app: &AppHandle,
     presentation: Arc<ManualPresentation>,
     request: u64,
+    identity: ManualRequestIdentity,
     result: Result<ManualSetResult, String>,
 ) {
     let handle = app.clone();
@@ -326,14 +334,20 @@ fn report_manual_result(
         presentation,
         request,
         result,
-        move |error| {
+        move |result| {
             if handle.try_state::<AppState>().is_some_and(|state| state.ensure_admission().is_err()) {
                 return;
             }
-            if error.is_some() {
+            if manual_result_error(&result).is_some() {
                 show_main_window(&handle);
             }
-            if let Err(error) = handle.emit("controller-error", error) {
+            let published = match result {
+                Ok(result) => handle.emit("manual-control-result", result),
+                Err(message) => handle.emit("controller-error", ManualControlError {
+                    scope: TargetMonitor::All, request: identity, message,
+                }),
+            };
+            if let Err(error) = published {
                 eprintln!("Cannot display tray HDR result: {error}");
             }
         },
@@ -351,18 +365,19 @@ fn manual_all(app: &AppHandle, enable: bool, presentation: &Arc<ManualPresentati
             return;
         }
     };
+    let identity = ManualRequestIdentity { client_id: "tray".into(), sequence: sequence.to_string() };
     let Some(state) = app.try_state::<AppState>() else {
         report_manual_result(
-            app, presentation.clone(), sequence, Err("HDR control has not initialized.".into()),
+            app, presentation.clone(), sequence, identity, Err("HDR control has not initialized.".into()),
         );
         return;
     };
     let request = state.ensure_admission()
-        .and_then(|()| state.monitor_service.manual_set(TargetMonitor::All, enable));
+        .and_then(|()| state.monitor_service.manual_set(TargetMonitor::All, enable, identity.clone()));
     let request = match request {
         Ok(request) => request,
         Err(error) => {
-            report_manual_result(app, presentation.clone(), sequence, Err(error));
+            report_manual_result(app, presentation.clone(), sequence, identity, Err(error));
             return;
         }
     };
@@ -370,7 +385,7 @@ fn manual_all(app: &AppHandle, enable: bool, presentation: &Arc<ManualPresentati
     let handle = app.clone();
     let presentation = presentation.clone();
     tauri::async_runtime::spawn(async move {
-        report_manual_result(&handle, presentation, sequence, request.resolve().await);
+        report_manual_result(&handle, presentation, sequence, identity, request.resolve().await);
     });
 }
 
@@ -468,6 +483,8 @@ mod tests {
 
     fn manual_reply(enable: bool, uncertain: bool) -> Result<ManualSetResult, String> {
         Ok(ManualSetResult {
+            scope: TargetMonitor::All,
+            request: ManualRequestIdentity { client_id: "tray".into(), sequence: "1".into() },
             outcomes: vec![MonitorOutcome {
                 device_path: Some("fixture-display".into()),
                 display_name: Some("Fixture display".into()),
@@ -504,7 +521,8 @@ mod tests {
             presentation.clone(),
             request,
             result,
-            move |error| {
+            move |result| {
+                let error = manual_result_error(&result);
                 let mut state = presented.lock().unwrap();
                 state.opened_windows += usize::from(error.is_some());
                 state.error = error;
@@ -578,6 +596,10 @@ mod tests {
 
     fn status(scope: ScopeHdrState) -> HdrStatePayload {
         HdrStatePayload {
+            status_revision: "1".into(),
+            manual_revision: "0".into(),
+            manual_results: Vec::new(),
+            inventory_revision: "1".into(),
             is_hdr_active: scope == ScopeHdrState::Hdr,
             scope_hdr_state: scope,
             manual_control: ManualControl::Available,
@@ -615,6 +637,7 @@ mod tests {
         let mut state = status(ScopeHdrState::Sdr);
         state.quarantined_apps.push(crate::runtime_policy::QuarantinedApp {
             name: "Age of Empires IV".into(), exe_name: "BsSndRpt64.exe".into(),
+            row_index: 0, path: None, reason: crate::runtime_policy::RepairReason::Helper,
         });
         assert_eq!(status_label(false, Some(&state)), "Game executable blocked - open My Games");
         assert!(status_label(true, Some(&state)).contains("Moje hry"));

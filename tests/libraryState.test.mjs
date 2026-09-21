@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findLibraryApp, findTrackedApp } from '../src/libraryState.ts';
+import { captureLibraryRow, findLibraryApp, findTrackedApp, libraryRowIdentity, pathAfterExecutableEdit, primaryExecutable } from '../src/libraryState.ts';
 import { ConfigClient } from '../src/configState.ts';
 
 const app = (overrides = {}) => ({
@@ -54,8 +54,9 @@ test('catalog add then remove uses the canonical primary returned by the committ
       assert.equal(args.app.exe_name, 'game.exe');
       current.settings.apps = [{ ...existing, enabled: true, alternate_exes: ['game.exe'] }];
     } else if (command === 'remove_app') {
-      assert.equal(args.exeName, 'renderer.exe');
-      current.settings.apps = current.settings.apps.filter((item) => item.exe_name !== args.exeName);
+      assert.deepEqual(args.row, { index: 0, exe_name: 'renderer.exe', path: existing.path });
+      assert.equal(args.expectedLibraryGeneration, current.library_generation);
+      current.settings.apps.splice(args.row.index, 1);
     } else {
       throw new Error(`Unexpected mutation ${command}`);
     }
@@ -71,7 +72,9 @@ test('catalog add then remove uses the canonical primary returned by the committ
   assert.equal(tracked.exe_name, 'renderer.exe');
   assert.equal(tracked.path, existing.path);
   assert.equal(tracked.steam_id, '100');
-  await client.mutate('remove_app', { exeName: tracked.exe_name });
+  await client.mutate('remove_app', {
+    row: libraryRowIdentity(client.getView().snapshot.settings.apps, tracked),
+  }, client.captureOrigin());
   assert.equal(client.getView().snapshot.settings.apps.length, 0);
   assert.deepEqual(requests.map((item) => item.command), ['add_custom_app', 'remove_app']);
 });
@@ -96,4 +99,49 @@ test('exact-primary matching preserves the established canonical executable key'
   const incoming = app({ exe_name: 'RENDERER.EXE', steam_id: '200' });
   assert.equal(findLibraryApp([existing], incoming), existing);
   assert.equal(findTrackedApp([existing], incoming), existing);
+});
+
+test('duplicate primary rows use an exact path or stay ambiguous, never first-match', () => {
+  const first = app();
+  const second = app({ path: 'E:\\Other\\renderer.exe' });
+  assert.equal(findLibraryApp([first, second], second), second);
+  assert.equal(findLibraryApp([second, first], first), first);
+  assert.equal(findLibraryApp([first, second], { exe_name: 'renderer.exe' }), undefined);
+  assert.equal(findTrackedApp([first, second], { exe_name: 'renderer.exe' }), undefined);
+  assert.equal(findLibraryApp([first, { ...first }], first), undefined);
+});
+
+test('browse-edit-submit cannot retain a path bound to the previously picked executable', () => {
+  const picked = { exe_name: 'game.exe', path: 'D:\\Games\\game.exe' };
+  const edited = 'renderer';
+  const submitted = { ...picked, exe_name: primaryExecutable(edited),
+    path: pathAfterExecutableEdit(picked.path, edited) || undefined };
+  assert.equal(submitted.exe_name, 'renderer.exe');
+  assert.equal(submitted.path, undefined);
+  assert.equal(pathAfterExecutableEdit(picked.path, 'GAME.EXE'), picked.path);
+  assert.equal(pathAfterExecutableEdit('\\\\?\\D:\\Games\\.\\game.exe', 'game'), '\\\\?\\D:\\Games\\.\\game.exe');
+  assert.equal(pathAfterExecutableEdit(picked.path, ''), '');
+});
+
+test('row command identity distinguishes same-path duplicates without persisted IDs', () => {
+  const first = app();
+  const second = { ...first };
+  const rows = [first, second];
+  assert.equal(libraryRowIdentity(rows, first).index, 0);
+  assert.equal(libraryRowIdentity(rows, second).index, 1);
+  assert.throws(() => libraryRowIdentity(rows, { ...first }), /row changed/);
+});
+
+test('rendered row identity cannot borrow the generation of a newer not-yet-rendered library', async () => {
+  const rows = [app(), app()];
+  const snapshot = { mode: 'ready', context_token: 'ctx', library_generation: '4',
+    revision: '4', control_epoch: '4', settings: { apps: rows } };
+  const client = new ConfigClient(async () => snapshot);
+  await client.refresh();
+  const action = captureLibraryRow(client, rows, rows[1]);
+  assert.equal(action.row.index, 1);
+  assert.equal(action.origin.libraryGeneration, '4');
+  client.acceptEvent({ ...snapshot, revision: '5', control_epoch: '5', library_generation: '5',
+    settings: { apps: [rows[1]] } });
+  assert.throws(() => captureLibraryRow(client, rows, rows[0]), /library view changed/);
 });

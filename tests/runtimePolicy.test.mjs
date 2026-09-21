@@ -41,10 +41,45 @@ test('status and tray consume derived quarantine without persisted schema or a n
   assert.match(source('src-tauri/src/tray.rs'), /!status.quarantined_apps.is_empty\(\)/);
 });
 
+test('primary/path repair warning is distinct, actionable and identifies the affected row in both languages', () => {
+  const status = { warning: null, quarantined_apps: [{
+    row_index: 2, name: 'Custom game', exe_name: 'game.exe', path: 'D:\\Game\\renderer.exe',
+    reason: 'primary_path_mismatch',
+  }] };
+  for (const language of ['en', 'cs']) {
+    const warnings = statusWarnings(status, dictionaries[language]);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /Custom game/);
+    assert.match(warnings[0], /game.exe/);
+    assert.notEqual(warnings[0], dictionaries[language].quarantineWarning('Custom game', 'game.exe'));
+  }
+  assert.match(statusWarnings(status, dictionaries.en)[0], /path does not match/);
+  assert.match(statusWarnings(status, dictionaries.en)[0], /settings remain unchanged/);
+});
+
+test('library mutation IPC requires a generation fence and never mutates by executable alone', () => {
+  const commands = source('src-tauri/src/commands.rs');
+  for (const name of ['remove_app', 'toggle_app', 'repair_app_executable']) {
+    const body = commands.slice(commands.indexOf(`pub fn ${name}(`)).split('#[tauri::command]')[0];
+    assert.match(body, /row: library::AppRowIdentity/);
+    assert.match(body, /expected_library_generation: String/);
+    assert.match(body, /Some\(&expected_library_generation\)/);
+    assert.doesNotMatch(body, /\.retain\(|\.find\(/);
+  }
+});
+
+test('manual catalog synchronization respects the native safe-test and shutdown gates', () => {
+  const commands = source('src-tauri/src/commands.rs');
+  const body = commands.slice(commands.indexOf('pub async fn sync_database(')).split('#[tauri::command]')[0];
+  assert.match(body, /state.ensure_admission\(\)\?/);
+  assert.match(body, /if state.safe_test_mode[\s\S]*?return Err/);
+  assert.ok(body.indexOf('if state.safe_test_mode') < body.indexOf('database::fetch_online_database()'));
+});
+
 test('manual repair reuses picker, reports helper selection errors and fences library generation', async () => {
   const component = source('src/components/AppsManager.tsx');
   const repair = component.slice(component.indexOf('const handleRepairExecutable'), component.indexOf('// Verify paths'));
-  assert.match(repair, /captureOrigin\(\)/);
+  assert.match(repair, /captureLibraryRow\(configClient, config.apps, app\)/);
   assert.match(repair, /'pick_game_exe'/);
   assert.match(repair, /'repair_app_executable'/);
   assert.match(repair, /configClient.reportError\(err\)/);

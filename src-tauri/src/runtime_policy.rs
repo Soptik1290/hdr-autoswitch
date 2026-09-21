@@ -13,28 +13,57 @@ pub fn permanently_excluded(exe: &str) -> bool {
 }
 
 pub fn is_quarantined(app: &HdrApp) -> bool {
-    permanently_excluded(&app.exe_name)
+    repair_reason(app).is_some()
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairReason {
+    Helper,
+    PrimaryPathMismatch,
+}
+
+pub fn primary_path_consistent(app: &HdrApp) -> bool {
+    match app.path.as_deref() {
+        None | Some("") => true,
+        Some(path) => normalize_windows_path(path).is_some_and(|path| {
+            path.rsplit('\\').next().is_some_and(|basename| basename.eq_ignore_ascii_case(&app.exe_name))
+        }),
+    }
+}
+
+fn repair_reason(app: &HdrApp) -> Option<RepairReason> {
+    if permanently_excluded(&app.exe_name) {
+        Some(RepairReason::Helper)
+    } else if !primary_path_consistent(app) {
+        Some(RepairReason::PrimaryPathMismatch)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct QuarantinedApp {
+    pub row_index: usize,
     pub name: String,
     pub exe_name: String,
+    pub path: Option<String>,
+    pub reason: RepairReason,
 }
 
 pub fn quarantined_apps(config: &AppConfig) -> Vec<QuarantinedApp> {
-    let mut rows: Vec<_> = config
+    config
         .apps
         .iter()
-        .filter(|app| is_quarantined(app))
-        .map(|app| QuarantinedApp {
+        .enumerate()
+        .filter_map(|(row_index, app)| repair_reason(app).map(|reason| QuarantinedApp {
+            row_index,
             name: app.name.clone(),
             exe_name: app.exe_name.clone(),
-        })
-        .collect();
-    rows.sort();
-    rows.dedup();
-    rows
+            path: app.path.clone(),
+            reason,
+        }))
+        .collect()
 }
 
 /// Lexical Win32 image-path comparison, including canonical verbatim paths from scanners.
@@ -108,6 +137,26 @@ fn unscoped_claim(app: &HdrApp, exe: &str) -> bool {
         || app.alternate_exes.iter().any(|alias| {
             !alias.eq_ignore_ascii_case(&app.exe_name) && alias.eq_ignore_ascii_case(exe)
         })
+}
+
+/// Distinct path-bound primaries coexist; aliases and pathless primaries claim a basename.
+pub fn claims_overlap(left: &HdrApp, right: &HdrApp) -> bool {
+    std::iter::once(&left.exe_name).chain(&left.alternate_exes).any(|exe| {
+        !permanently_excluded(exe)
+            && std::iter::once(&right.exe_name).chain(&right.alternate_exes).any(|other| {
+                if !exe.eq_ignore_ascii_case(other) {
+                    return false;
+                }
+                if exe.eq_ignore_ascii_case(&left.exe_name) && other.eq_ignore_ascii_case(&right.exe_name) {
+                    return !matches!(
+                        (left.path.as_deref().and_then(normalize_windows_path),
+                         right.path.as_deref().and_then(normalize_windows_path)),
+                        (Some(left), Some(right)) if left != right
+                    );
+                }
+                true
+            })
+    })
 }
 
 /// Disabled and quarantined claims veto unscoped enrollment/matching, not unrelated installations.
@@ -348,6 +397,28 @@ mod tests {
         }
         for fuzzy in ["game_dx12.exe", "game-win64-shipping.exe", "GameDX12.exe"] {
             assert_eq!(resolve(&config, None, fuzzy), Resolution::NoMatch);
+        }
+    }
+
+    #[test]
+    fn audit_legacy_primary_alias_path_mismatches_are_derived_quarantine_without_rewrite() {
+        for path in [r"C:\Game\renderer.exe", r"C:\Game\BsSndRpt.exe", "relative.exe"] {
+            for enabled in [false, true] {
+                let mut row = app("game.exe", Some(path), enabled);
+                row.alternate_exes = vec!["renderer.exe".into(), "BsSndRpt.exe".into()];
+                let mut config = AppConfig::default();
+                config.apps = vec![row.clone(), row];
+                let before = config.clone();
+                assert_eq!(resolve(&config, Some(path), "renderer.exe"), Resolution::Quarantined);
+                assert!(resolve(&config, Some(r"C:\Game\game.exe"), "game.exe").matched().is_none());
+                let repairs = quarantined_apps(&config);
+                assert_eq!(repairs.len(), 2);
+                assert_eq!(repairs[0].reason, RepairReason::PrimaryPathMismatch);
+                assert_eq!(repairs[0].row_index, 0);
+                assert_eq!(repairs[1].row_index, 1);
+                assert_eq!(repairs[0].path.as_deref(), Some(path));
+                assert_eq!(config, before);
+            }
         }
     }
 }

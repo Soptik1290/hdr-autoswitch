@@ -71,8 +71,10 @@ export interface Translations {
   // Apps Manager
   appsTitle: string;
   appsRepairExecutable: string;
+  appsHelperAliasCleanup: string;
   appsQuarantined: string;
   quarantineWarning: (game: string, executable: string) => string;
+  primaryPathWarning: (game: string, executable: string) => string;
   appsCountSummary: (total: number, active: number) => string;
   appsSubtitle: string;
   appsScanBtn: string;
@@ -96,6 +98,7 @@ export interface Translations {
   // Scan Modal
   scanModalTitle: (count: number) => string;
   scanModalSubtitle: string;
+  scanModalSupportUnverified: string;
   scanModalCancel: string;
   scanModalAddSelected: string;
   scanModalSuccess: (count: number) => string;
@@ -234,6 +237,7 @@ export interface Translations {
   configMonitorIdentityError: string;
   configManualPolicy: string;
   configManualUnavailable: string;
+  manualRequestRetryHint: string;
   configAllOn: string;
   configAllOff: string;
   configStatusUnknown: string;
@@ -246,8 +250,10 @@ export interface Translations {
 
 const cs: Translations = {
   appsRepairExecutable: 'Vybrat skutečný herní soubor',
+  appsHelperAliasCleanup: 'Potvrzená aktualizace odstraní dříve uložené blokované pomocné soubory z alternativních spustitelných souborů. Ostatní alternativní soubory zůstanou zachovány.',
   appsQuarantined: 'Blokovaný soubor',
   quarantineWarning: (game, executable) => `${game}: soubor ${executable} je blokován. Automatické rozpoznávání této hry je blokováno; uložená nastavení zůstávají beze změny. V Moje hry vyberte skutečný herní soubor. Oprava odstraní staré alternativní soubory.`,
+  primaryPathWarning: (game, executable) => `${game}: uložená cesta neodpovídá hlavnímu souboru ${executable}. Automatické rozpoznávání je blokováno; nastavení zůstávají beze změny. V Moje hry znovu vyberte skutečný herní soubor. Oprava odstraní staré alternativní soubory.`,
   appTitle: 'HDR AUTO-SWITCH',
   hdrActive: 'HDR AKTIVNÍ',
   hdrMixed: 'SMÍŠENÝ STAV HDR / SDR',
@@ -329,13 +335,14 @@ const cs: Translations = {
   appsRemoveFromLibrary: 'Odebrat z knihovny',
 
   scanModalTitle: (count) => `NALEZENÉ HRY V PC (${count})`,
-  scanModalSubtitle: 'Hry s ověřenou podporou HDR jsou předvybrány nahoře. Ostatní nainstalované hry můžete zařadit níže:',
+  scanModalSubtitle: 'Hry s ověřenou podporou HDR jsou nahoře. Předvýběr řídí nastavení automatického rozpoznávání; k importu vyberte libovolné hry:',
+  scanModalSupportUnverified: 'HDR NEOVĚŘENO',
   scanModalCancel: 'ZRUŠIT',
   scanModalAddSelected: 'PŘIDAT VYBRANÉ',
   scanModalSuccess: (count) => `Úspěšně importováno nebo aktualizováno ${count} her.`,
   scanModalError: 'Chyba při prohledávání disků.',
-  scanModalSectionHdr: (count) => `HRY S PODPOROU HDR (${count}) — AUTOMATICKY AKTIVNÍ`,
-  scanModalSectionSdr: (count) => `OSTATNÍ NAINSTALOVANÉ HRY (${count}) — SDR (LZE VYUŽÍT RTX HDR / MODY)`,
+  scanModalSectionHdr: (count) => `HRY S OVĚŘENOU PODPOROU HDR (${count})`,
+  scanModalSectionSdr: (count) => `OSTATNÍ NAINSTALOVANÉ HRY (${count}) — PODPORA HDR NEOVĚŘENA`,
   scanModalStatusNew: 'NOVÁ HRA',
   scanModalStatusInLibrary: 'V KNIHOVNĚ',
   scanModalStatusPathUpdate: 'AKTUALIZOVAT CESTU',
@@ -464,6 +471,7 @@ const cs: Translations = {
   configMonitorIdentityError: 'Trvalá identita displeje není dostupná; ovládání je zablokované.',
   configManualPolicy: 'Ruční nativní Zapnout/Vypnout platí jen pro výslovně zvolený displej nebo Vše. Funguje i při pozastavené automatizaci; nemění nastavení ani souhlas s automatickým HDR. Konflikt ovladače, ukončování nebo nedostupná autorita ovládání blokují.',
   configManualUnavailable: 'Ruční HDR není dostupné: ověřte autoritu ovládání, identitu a stav displeje.',
+  manualRequestRetryHint: 'Doručení požadavku nebylo potvrzeno. Zopakujte stejný ovládací prvek v původním okně nebo nabídce tray. Výsledek jiného požadavku tuto chybu nesmaže.',
   configAllOn: 'ZAPNOUT HDR NA VŠECH DISPLEJÍCH',
   configAllOff: 'VYPNOUT HDR NA VŠECH DISPLEJÍCH',
   configStatusUnknown: 'STAV HDR NEZNÁMÝ / POZASTAVENO',
@@ -476,8 +484,10 @@ const cs: Translations = {
 
 const en: Translations = {
   appsRepairExecutable: 'Select actual game executable',
+  appsHelperAliasCleanup: 'Confirming an update removes previously saved blocked helper aliases. Other executable aliases are preserved.',
   appsQuarantined: 'Blocked executable',
   quarantineWarning: (game, executable) => `${game}: ${executable} is blocked. Automatic matching for this game is blocked; saved settings remain unchanged. Select the actual game executable in My Games. Repair removes historical executable aliases.`,
+  primaryPathWarning: (game, executable) => `${game}: the saved path does not match primary executable ${executable}. Automatic matching is blocked; saved settings remain unchanged. Select the actual game executable again in My Games. Repair removes historical executable aliases.`,
   appTitle: 'HDR AUTO-SWITCH',
   hdrActive: 'HDR ACTIVE',
   hdrMixed: 'MIXED HDR / SDR',
@@ -559,13 +569,14 @@ const en: Translations = {
   appsRemoveFromLibrary: 'Remove from library',
 
   scanModalTitle: (count) => `FOUND GAMES ON PC (${count})`,
-  scanModalSubtitle: 'Games with verified HDR support are pre-selected at the top. Other installed games can be included below:',
+  scanModalSubtitle: 'Verified HDR games are grouped first. Automatic detection controls initial selection; select any games to import:',
+  scanModalSupportUnverified: 'HDR UNVERIFIED',
   scanModalCancel: 'CANCEL',
   scanModalAddSelected: 'ADD SELECTED',
   scanModalSuccess: (count) => `Successfully imported or updated ${count} games.`,
   scanModalError: 'Failed to scan storage drives.',
-  scanModalSectionHdr: (count) => `HDR SUPPORTED GAMES (${count}) — ENABLED BY DEFAULT`,
-  scanModalSectionSdr: (count) => `OTHER INSTALLED GAMES (${count}) — SDR (COMPATIBLE WITH RTX HDR / MODS)`,
+  scanModalSectionHdr: (count) => `VERIFIED HDR SUPPORTED GAMES (${count})`,
+  scanModalSectionSdr: (count) => `OTHER INSTALLED GAMES (${count}) — HDR SUPPORT UNVERIFIED`,
   scanModalStatusNew: 'NEW',
   scanModalStatusInLibrary: 'IN LIBRARY',
   scanModalStatusPathUpdate: 'UPDATE PATH',
@@ -694,6 +705,7 @@ const en: Translations = {
   configMonitorIdentityError: 'A persistent display identity is unavailable; control is blocked.',
   configManualPolicy: 'Manual native On/Off applies only to the explicitly chosen display or All. It remains available while automation is paused and never changes settings or automatic HDR consent. Controller conflicts, shutdown, or unavailable authority block manual control.',
   configManualUnavailable: 'Manual HDR is unavailable: check controller authority, display identity, and state.',
+  manualRequestRetryHint: 'Request delivery was not confirmed. Retry the same control from the original window or tray menu. An unrelated result will not dismiss this error.',
   configAllOn: 'TURN HDR ON FOR ALL DISPLAYS',
   configAllOff: 'TURN HDR OFF FOR ALL DISPLAYS',
   configStatusUnknown: 'HDR STATE UNKNOWN / PAUSED',

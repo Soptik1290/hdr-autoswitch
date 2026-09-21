@@ -1,4 +1,4 @@
-use crate::config::{HdrApp, HdrType};
+use crate::config::HdrType;
 use crate::database;
 use crate::automatic_authority::{self, Authority, InstallEvidence, LaunchField, Provider, ResolvedGame};
 use serde::{Deserialize, Serialize};
@@ -23,18 +23,64 @@ pub struct PickedGameInfo {
     pub launcher: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ScanEvidence {
+    Verified,
+    Unverified { reason: ScanUnverifiedReason },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanUnverifiedReason {
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanGame {
+    pub name: String,
+    pub exe_name: String,
+    pub hdr_type: HdrType,
+    pub path: Option<String>,
+    pub alternate_exes: Vec<String>,
+    pub steam_id: Option<String>,
+    pub launcher: Option<String>,
+    // False means support is unverified, not proof that the installation is SDR-only.
+    pub is_hdr_supported: bool,
+    pub default_selected: bool,
+    pub evidence: ScanEvidence,
+}
+
+impl ScanGame {
+    fn verified(resolved: &ResolvedGame) -> Self {
+        let app = resolved.as_app(false);
+        Self {
+            name: app.name,
+            exe_name: app.exe_name,
+            hdr_type: app.hdr_type,
+            path: app.path,
+            alternate_exes: app.alternate_exes,
+            steam_id: app.steam_id,
+            launcher: app.launcher,
+            is_hdr_supported: true,
+            default_selected: true,
+            evidence: ScanEvidence::Verified,
+        }
+    }
+}
+
 pub struct ScanResult {
-    pub detected: Vec<HdrApp>,
+    pub detected: Vec<ScanGame>,
     pub verified: Vec<ResolvedGame>,
 }
 
 #[derive(Default)]
 struct ScanCollection {
-    detected: HashMap<String, HdrApp>,
+    detected: HashMap<String, ScanGame>,
     verified: Vec<ResolvedGame>,
 }
 
-pub fn scan_installed_games(auto_detect: bool) -> Vec<HdrApp> {
+pub fn scan_installed_games(auto_detect: bool) -> Vec<ScanGame> {
     scan_installed_games_with_authority(auto_detect).detected
 }
 
@@ -60,22 +106,28 @@ pub fn scan_installed_games_with_authority(auto_detect: bool) -> ScanResult {
     // 6. Scan common media players
     scan_media_players(&catalog, &mut detected_map);
 
-    let mut result: Vec<HdrApp> = detected_map.detected.into_values().collect();
-    for game in &mut result {
-        game.enabled &= auto_detect;
-    }
+    detected_map.finish(auto_detect)
+}
 
-    // Sort: HDR-enabled games first (alphabetically), then SDR games (alphabetically)
-    result.sort_by(|a, b| {
-        match (a.enabled, b.enabled) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase())
-                .then(a.exe_name.cmp(&b.exe_name)).then(a.path.cmp(&b.path)),
+impl ScanCollection {
+    fn finish(self, auto_detect: bool) -> ScanResult {
+        let mut detected: Vec<ScanGame> = self.detected.into_values().collect();
+        for game in &mut detected {
+            game.default_selected &= auto_detect;
         }
-    });
 
-    ScanResult { detected: result, verified: detected_map.verified }
+        // Verified HDR support sorts first, independently of the import preference.
+        detected.sort_by(|a, b| {
+            b.is_hdr_supported.cmp(&a.is_hdr_supported)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then(a.exe_name.cmp(&b.exe_name))
+                .then(a.path.cmp(&b.path))
+                .then(a.launcher.cmp(&b.launcher))
+                .then(a.steam_id.cmp(&b.steam_id))
+        });
+
+        ScanResult { detected, verified: self.verified }
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -673,7 +725,7 @@ fn match_and_insert_game(
     };
     let app = match automatic_authority::resolve(catalog, Some(&evidence)) {
         Authority::Resolved(resolved) => {
-            let app = resolved.as_app(true);
+            let app = ScanGame::verified(&resolved);
             if !map.verified.iter().any(|known| {
                 known.provider == resolved.provider
                     && known.product_id == resolved.product_id
@@ -689,15 +741,17 @@ fn match_and_insert_game(
                 eprintln!("No unique declared executable for {}", game_dir.display());
                 return;
             };
-            HdrApp {
+            ScanGame {
                 name: hint_name.trim().to_owned(),
                 exe_name: selected.basename,
-                enabled: false,
                 hdr_type: HdrType::Custom,
                 path: Some(selected.path.to_string_lossy().into_owned()),
                 alternate_exes: Vec::new(),
                 steam_id: None,
                 launcher: Some(provider.launcher().into()),
+                is_hdr_supported: false,
+                default_selected: false,
+                evidence: ScanEvidence::Unverified { reason: ScanUnverifiedReason::Unresolved },
             }
         }
         result => {
@@ -953,12 +1007,121 @@ fn read_registry_string(root: HKEY, subkey: &str, value_name: &str) -> Result<St
 mod tests {
     use super::*;
 
+    fn scan_fixture(name: &str, verified: bool) -> ScanGame {
+        ScanGame {
+            name: name.into(),
+            exe_name: "game.exe".into(),
+            hdr_type: if verified { HdrType::Native } else { HdrType::Custom },
+            path: Some(format!(r"C:\Games\{name}\game.exe")),
+            alternate_exes: Vec::new(),
+            steam_id: None,
+            launcher: Some("Windows".into()),
+            is_hdr_supported: verified,
+            default_selected: verified,
+            evidence: if verified {
+                ScanEvidence::Verified
+            } else {
+                ScanEvidence::Unverified { reason: ScanUnverifiedReason::Unresolved }
+            },
+        }
+    }
+
     fn create_files(root: &Path, files: &[&str]) {
         for name in files {
             let path = root.join(name);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"fixture, never executed").unwrap();
         }
+    }
+
+    #[test]
+    fn correction_scan_dto_auto_detect_changes_selection_only() {
+        let games = [scan_fixture("A unverified", false), scan_fixture("Z verified", true)];
+        let collection = || ScanCollection {
+            detected: games.iter().cloned().map(|game| (game.name.clone(), game)).collect(),
+            verified: Vec::new(),
+        };
+        let selected = collection().finish(true).detected;
+        let unselected = collection().finish(false).detected;
+        assert_eq!(selected[0].name, "Z verified");
+        assert!(selected[0].default_selected);
+        assert!(!selected[1].default_selected);
+        assert_eq!(unselected[0].name, "Z verified");
+        for (mut with_default, without_default) in selected.into_iter().zip(&unselected) {
+            with_default.default_selected = false;
+            assert_eq!(&with_default, without_default);
+            let payload = serde_json::to_value(without_default).unwrap();
+            assert!(payload.get("enabled").is_none());
+            assert_eq!(payload["default_selected"], false);
+        }
+        assert!(unselected[0].is_hdr_supported);
+        assert_eq!(serde_json::to_value(&unselected[0]).unwrap()["evidence"],
+            serde_json::json!({ "status": "verified" }));
+        assert!(!unselected[1].is_hdr_supported);
+        assert_eq!(serde_json::to_value(&unselected[1]).unwrap()["evidence"],
+            serde_json::json!({ "status": "unverified", "reason": "unresolved" }));
+    }
+
+    #[test]
+    fn correction_scan_dto_keeps_verified_enrichment_when_auto_detect_is_off() {
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        create_files(root.path(), &["game.exe"]);
+        let catalog = database::authored_test_catalog(vec![serde_json::from_value(serde_json::json!({
+            "name": "Game", "exe_name": "game.exe", "hdr_type": "native", "support_tier": "native"
+        })).unwrap()]);
+        let mut scan = ScanCollection::default();
+        match_and_insert_game(
+            &catalog, "Install title", root.path(), &["game.exe".into()],
+            &mut scan, Provider::Windows, None,
+        );
+        let scan = scan.finish(false);
+        assert_eq!(scan.detected.len(), 1);
+        assert_eq!(scan.verified.len(), 1);
+        assert!(scan.detected[0].is_hdr_supported);
+        assert!(!scan.detected[0].default_selected);
+        assert_eq!(scan.detected[0].evidence, ScanEvidence::Verified);
+        assert_eq!(scan.verified[0].as_app(true).exe_name, scan.detected[0].exe_name);
+    }
+
+    #[test]
+    fn correction_scan_dto_does_not_downgrade_failed_authority_to_manual_suggestions() {
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        create_files(root.path(), &["game.exe"]);
+        let catalog = database::authored_test_catalog(["First", "Second"].into_iter().map(|name| {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "exe_name": "game.exe", "hdr_type": "native", "support_tier": "native"
+            })).unwrap()
+        }).collect());
+        let declarations = vec!["game.exe".into()];
+        let evidence = InstallEvidence::observe(Provider::Windows, None, root.path(), &declarations).unwrap();
+        assert!(matches!(automatic_authority::resolve(&catalog, Some(&evidence)), Authority::Ambiguous));
+        let mut ambiguous = ScanCollection::default();
+        match_and_insert_game(
+            &catalog, "Ambiguous", root.path(), &declarations, &mut ambiguous, Provider::Windows, None,
+        );
+        assert!(ambiguous.detected.is_empty());
+        assert!(ambiguous.verified.is_empty());
+
+        let missing = root.path().join("missing");
+        assert!(matches!(
+            InstallEvidence::observe(Provider::Windows, None, &missing, &declarations),
+            Err(automatic_authority::EvidenceError::Inaccessible)
+        ));
+        let mut inaccessible = ScanCollection::default();
+        match_and_insert_game(
+            &catalog, "Inaccessible", &missing, &declarations, &mut inaccessible, Provider::Windows, None,
+        );
+        assert!(inaccessible.detected.is_empty());
+        assert!(inaccessible.verified.is_empty());
+
+        let evidence = InstallEvidence::observe(Provider::Steam, Some("invalid"), root.path(), &[]).unwrap();
+        assert!(matches!(automatic_authority::resolve(&catalog, Some(&evidence)), Authority::Conflict));
+        let mut conflicting = ScanCollection::default();
+        match_and_insert_game(
+            &catalog, "Conflict", root.path(), &[], &mut conflicting, Provider::Steam, Some("invalid"),
+        );
+        assert!(conflicting.detected.is_empty());
+        assert!(conflicting.verified.is_empty());
     }
 
     #[test]
@@ -997,7 +1160,9 @@ mod tests {
             if matches!(provider, Provider::Epic | Provider::Gog | Provider::Windows) {
                 match_and_insert_game(&catalog, "Resident Evil 7: Biohazard", root.path(), &["unlisted.exe".into()], &mut map, provider, None);
                 let app = map.detected.values().next().unwrap();
-                assert!(!app.enabled);
+                assert!(!app.is_hdr_supported);
+                assert!(!app.default_selected);
+                assert_eq!(app.evidence, ScanEvidence::Unverified { reason: ScanUnverifiedReason::Unresolved });
                 assert_eq!(app.hdr_type, HdrType::Custom);
                 assert_eq!(app.exe_name, "unlisted.exe");
                 assert!(app.alternate_exes.is_empty());
@@ -1040,7 +1205,10 @@ mod tests {
                     &catalog, "Fetched title", root.path(), &[exe.into()], &mut scan, provider, None,
                 );
                 assert!(scan.verified.is_empty(), "{provider:?}: {exe} became verified without source authority");
-                assert!(scan.detected.values().all(|app| !app.enabled && app.hdr_type == HdrType::Custom));
+                assert!(scan.detected.values().all(|app|
+                    !app.is_hdr_supported && !app.default_selected && app.hdr_type == HdrType::Custom
+                        && app.evidence == ScanEvidence::Unverified { reason: ScanUnverifiedReason::Unresolved }
+                ));
             }
         }
     }
@@ -1115,6 +1283,18 @@ mod tests {
         assert!(app.alternate_exes.is_empty());
         assert!(app.steam_id.is_none());
         assert_eq!(app.launcher.as_deref(), Some("Xbox"));
+        assert!(app.is_hdr_supported);
+        assert_eq!(app.evidence, ScanEvidence::Verified);
+        let app = crate::config::HdrApp {
+            name: app.name,
+            exe_name: app.exe_name,
+            enabled: true,
+            hdr_type: app.hdr_type,
+            path: app.path,
+            alternate_exes: app.alternate_exes,
+            steam_id: app.steam_id,
+            launcher: app.launcher,
+        };
         let mut explicit = AppConfig::default();
         explicit.apps.clear();
         library::import_games(&mut explicit, vec![app.clone()]).unwrap();

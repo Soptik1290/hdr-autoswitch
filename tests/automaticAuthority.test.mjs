@@ -25,7 +25,8 @@ test('startup enrichment and scanner defaults cannot bypass provider authority o
   assert.doesNotMatch(background, /library::enrich_existing/);
   assert.match(background, /mutate_if_changed/);
   assert.match(source('commands'), /scan_installed_games\(auto_detect\)/);
-  assert.match(source('scanner'), /game.enabled &= auto_detect/);
+  assert.match(source('scanner'), /game.default_selected &= auto_detect/);
+  assert.doesNotMatch(source('scanner'), /game\.is_hdr_supported\s*[&|]?=\s*auto_detect/);
   const library = source('library');
   const enrichment = library.slice(library.indexOf('fn verified_association('), library.indexOf('pub fn validate_app('));
   assert.doesNotMatch(enrichment, /merge_aliases|same_game|\.enabled\s*=|\.path\s*=|\.exe_name\s*=/);
@@ -77,7 +78,8 @@ test('scan observations retain resolved authority separately from manual-only su
   assert.match(matcher, /Authority::Resolved\(resolved\)[\s\S]*?map\.verified\.push\(resolved\)/);
   const suggestions = matcher.slice(matcher.indexOf('Authority::Unresolved if'));
   assert.doesNotMatch(suggestions, /verified\.push/);
-  assert.match(suggestions, /enabled: false/);
+  assert.match(suggestions, /is_hdr_supported: false/);
+  assert.match(suggestions, /default_selected: false/);
 });
 
 test('explicit repair replaces quarantined bindings and scopes paths to the retained primary', () => {
@@ -89,8 +91,9 @@ test('explicit repair replaces quarantined bindings and scopes paths to the reta
   assert.match(repair, /existing\.exe_name\.eq_ignore_ascii_case\(&item\.exe_name\) && item\.path\.is_some\(\)/);
   const veto = library.slice(library.indexOf('pub fn automatic_enrollment_veto('), library.indexOf('fn same_game('));
   assert.match(veto, /app\.steam_id, &candidate\.steam_id/);
-  assert.match(veto, /app\.path\.as_deref\(\)\.and_then\(normalize_windows_path\)/);
-  assert.match(veto, /candidate\.path\.as_deref\(\)\.and_then\(normalize_windows_path\)/);
+  assert.match(veto, /claims_overlap\(app, candidate\)/);
+  assert.match(source('runtime_policy'), /left\.path\.as_deref\(\)\.and_then\(normalize_windows_path\)/);
+  assert.match(source('runtime_policy'), /right\.path\.as_deref\(\)\.and_then\(normalize_windows_path\)/);
   assert.doesNotMatch(veto, /same_game|merge_aliases|\.push\(/);
 });
 
@@ -98,8 +101,9 @@ test('targeted quarantine repair uses exact unique identity without changing use
   const library = source('library');
   const start = library.indexOf('pub fn repair_executable(');
   const repair = library.slice(start, library.indexOf('#[cfg(test)]', start));
-  assert.match(repair, /app\.exe_name\.eq_ignore_ascii_case\(exe_name\)/);
-  assert.match(repair, /matches\.next\(\)\.is_some\(\)/);
+  assert.match(repair, /row_index\(config, row\)\?/);
+  assert.match(repair, /reject_other_claims\(config, Some\(index\), &existing\)\?/);
+  assert.match(library, /app.exe_name != row.exe_name \|\| app.path != row.path/);
   assert.match(repair, /is_quarantined\(&config\.apps\[index\]\)/);
   assert.match(repair, /validate_executable\(&selected_exe\)/);
   assert.match(repair, /existing\.alternate_exes\.clear\(\)/);

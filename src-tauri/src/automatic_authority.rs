@@ -187,6 +187,68 @@ impl InstallEvidence {
         }
     }
 
+    pub fn candidate_executable(&self, hint_name: &str) -> Option<SelectedExecutable> {
+        let is_candidate = |f: &SelectedExecutable| -> bool {
+            let lower = f.basename.to_ascii_lowercase();
+            !permanently_excluded(&lower)
+                && !lower.contains("crash")
+                && !lower.contains("setup")
+                && !lower.contains("installer")
+                && !lower.contains("unins")
+                && !lower.contains("unitycrashhandler")
+                && !lower.contains("crashreportclient")
+                && !lower.contains("protocol")
+                && !lower.contains("helper")
+                && !lower.contains("eula")
+                && !lower.contains("reporter")
+                && !lower.contains("prereq")
+                && !lower.contains("redist")
+                && !lower.contains("benchmark")
+                && !lower.contains("dxsetup")
+                && !lower.contains("vcredist")
+                && !lower.contains("touchup")
+                && !lower.contains("config")
+                && !lower.contains("editor")
+                && !lower.contains("tool")
+        };
+
+        let mut valid_files: Vec<_> = self.files.iter().filter(|f| is_candidate(f)).collect();
+        if valid_files.is_empty() {
+            return None;
+        }
+
+        let hint_norm = hint_name
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>();
+
+        if !hint_norm.is_empty() {
+            if let Some(matched) = valid_files.iter().find(|f| {
+                let stem = f
+                    .basename
+                    .trim_end_matches(".exe")
+                    .trim_end_matches(".EXE")
+                    .to_ascii_lowercase()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect::<String>();
+                !stem.is_empty() && (stem == hint_norm || hint_norm.contains(&stem) || stem.contains(&hint_norm))
+            }) {
+                return Some((*matched).clone());
+            }
+        }
+
+        valid_files.sort_by_key(|f| {
+            let depth = f.relative.matches('\\').count();
+            let is_top = depth == 0;
+            let is_bin = f.relative.contains(r"bin\") || f.relative.contains(r"binaries\") || f.relative.contains(r"win64\");
+            if is_top { 0 } else if is_bin { 1 } else { 2 + depth }
+        });
+
+        valid_files.first().map(|f| (*f).clone())
+    }
+
     pub fn observe(
         provider: Provider,
         product_id: Option<&str>,
@@ -303,7 +365,7 @@ impl ResolvedGame {
             exe_name: self.executables[0].basename.clone(),
             enabled: auto_detect,
             hdr_type: self.catalog.hdr_type.clone(),
-            path: Some(self.executables[0].path.to_string_lossy().into_owned()),
+            path: Some(crate::runtime_policy::clean_path_display(&self.executables[0].path)),
             alternate_exes: self.executables[1..]
                 .iter()
                 .map(|file| file.basename.clone())

@@ -80,6 +80,20 @@ pub fn normalize_windows_path(path: &str) -> Option<String> {
     Some(format!("{prefix}{}", parts.join("\\")))
 }
 
+/// Returns user-facing, display-ready path string without verbatim prefixes (`\\?\`).
+pub fn clean_path_display(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(unc) = s.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{unc}")
+    } else if let Some(disk) = s.strip_prefix(r"\\?\") {
+        disk.to_string()
+    } else {
+        s.into_owned()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution<'a> {
     Matched(&'a HdrApp),

@@ -542,28 +542,7 @@ fn scan_registry_uninstall_hive(
             let child_path = format!(r"{}\{}", subkey, child_name);
 
             if let Ok(display_name) = read_registry_string(root, &child_path, "DisplayName") {
-                let lower_name = display_name.to_lowercase();
-                // Filter out non-game software and launcher clients
-                if lower_name.contains("update")
-                    || lower_name.contains("redistributable")
-                    || lower_name.contains("driver")
-                    || lower_name.contains("visual c++")
-                    || lower_name.contains("directx")
-                    || lower_name.contains("sdk")
-                    || lower_name.contains("microsoft")
-                    || lower_name.contains("windows")
-                    || lower_name.contains("security")
-                    || lower_name.contains("antivirus")
-                    || lower_name.contains("vpn")
-                    || lower_name.contains("launcher")
-                    || lower_name.contains("game center")
-                    || lower_name.contains("anti-cheat")
-                    || lower_name.contains("service")
-                    || lower_name == "steam"
-                    || lower_name == "gog galaxy"
-                    || lower_name == "ubisoft connect"
-                    || lower_name == "epic games launcher"
-                {
+                if is_known_non_game_software(&display_name) {
                     continue;
                 }
 
@@ -649,6 +628,144 @@ fn scan_media_players(catalog: &[database::CatalogEntry], map: &mut ScanCollecti
     }
 }
 
+pub(crate) fn is_known_non_game_software(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("update")
+        || lower.contains("redistributable")
+        || lower.contains("driver")
+        || lower.contains("visual c++")
+        || lower.contains("directx")
+        || lower.contains("sdk")
+        || lower.contains("microsoft")
+        || lower.contains("windows")
+        || lower.contains("security")
+        || lower.contains("antivirus")
+        || lower.contains("vpn")
+        || lower.contains("launcher")
+        || lower.contains("game center")
+        || lower.contains("anti-cheat")
+        || lower.contains("service")
+        || lower == "steam"
+        || lower == "gog galaxy"
+        || lower == "ubisoft connect"
+        || lower == "epic games launcher"
+        // Hardware & system monitoring utilities
+        || lower.contains("aida64")
+        || lower.contains("ryzen master")
+        || lower.contains("amd software")
+        || lower.contains("nvidia")
+        || lower.contains("geforce")
+        || lower.contains("intel")
+        || lower.contains("corsair")
+        || lower.contains("icue")
+        || lower.contains("razer")
+        || lower.contains("synapse")
+        || lower.contains("logitech")
+        || lower.contains("g hub")
+        || lower.contains("afterburner")
+        || lower.contains("rivatuner")
+        || lower.contains("hwmonitor")
+        || lower.contains("cpu-z")
+        || lower.contains("gpu-z")
+        || lower.contains("crystaldisk")
+        || lower.contains("furmark")
+        || lower.contains("cinebench")
+        || lower.contains("armoury crate")
+        || lower.contains("gigabyte")
+        || lower.contains("asus")
+        || lower.contains("msi center")
+        || lower.contains("nzxt")
+        || lower.contains("realtek")
+        // Productivity, developer tools & utilities
+        || lower.contains("visual studio")
+        || lower.contains("vscode")
+        || lower.contains("git")
+        || lower.contains("python")
+        || lower.contains("node.js")
+        || lower.contains("docker")
+        || lower.contains("libreoffice")
+        || lower.contains("office")
+        || lower.contains("excel")
+        || lower.contains("word")
+        || lower.contains("powerpoint")
+        || lower.contains("adobe")
+        || lower.contains("acrobat")
+        || lower.contains("photoshop")
+        || lower.contains("premiere")
+        || lower.contains("7-zip")
+        || lower.contains("winrar")
+        || lower.contains("notepad++")
+        || lower.contains("sublime")
+        || lower.contains("vmware")
+        || lower.contains("virtualbox")
+        // Browsers & communication
+        || lower.contains("chrome")
+        || lower.contains("firefox")
+        || lower.contains("edge")
+        || lower.contains("brave")
+        || lower.contains("opera")
+        || lower.contains("discord")
+        || lower.contains("slack")
+        || lower.contains("teams")
+        || lower.contains("zoom")
+        || lower.contains("telegram")
+        || lower.contains("whatsapp")
+        || lower.contains("spotify")
+        || lower.contains("obs studio")
+        || lower.contains("streamlabs")
+}
+
+fn is_generic_software_binary(exe: &str) -> bool {
+    let lower = exe.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "setup.exe"
+            | "installer.exe"
+            | "install.exe"
+            | "uninstall.exe"
+            | "unins000.exe"
+            | "update.exe"
+            | "patch.exe"
+            | "helper.exe"
+            | "launcher.exe"
+            | "crashreporter.exe"
+            | "unitycrashhandler64.exe"
+            | "unitycrashhandler32.exe"
+    )
+}
+
+fn is_valid_windows_game(hint_name: &str, game_dir: &Path) -> bool {
+    let dir_str = game_dir.to_string_lossy().to_ascii_lowercase();
+    let hint_str = hint_name.to_ascii_lowercase();
+
+    if is_known_non_game_software(&hint_str) || is_known_non_game_software(&dir_str) {
+        return false;
+    }
+
+    let positive_patterns = [
+        r"\games\", r"\spiele\", r"\hry\", r"\jeux\", r"\igry\",
+        r"\ea games\", r"\electronic arts\", r"\origin games\",
+        r"\ubisoft\", r"\battle.net\", r"\blizzard\",
+        r"\riot games\", r"\epic games\", r"\gog galaxy\", r"\gog games\",
+        r"\rockstar games\", r"\bethesda\", r"\warframe\",
+        r"\genshin", r"\hoyoverse", r"\daum\",
+    ];
+    if positive_patterns.iter().any(|needle| dir_str.contains(needle)) {
+        return true;
+    }
+
+    if let Some(folder_name) = game_dir.file_name().and_then(|n| n.to_str()) {
+        let f_lower = folder_name.to_ascii_lowercase();
+        if f_lower.contains("game") || f_lower.contains("spiel") {
+            return true;
+        }
+    }
+
+    let parent = game_dir.parent().map(|p| p.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let is_generic_program_files = parent.ends_with(r"\program files") || parent.ends_with(r"\program files (x86)");
+    !is_generic_program_files
+}
+
 // --------------------------------------------------------------------------------------
 // Matching and Insertion Helpers
 // --------------------------------------------------------------------------------------
@@ -684,19 +801,33 @@ fn match_and_insert_game(
             }
             app
         }
-        Authority::Unresolved if matches!(provider, Provider::Epic | Provider::Gog | Provider::Windows) => {
-            let Some(selected) = evidence.manual_suggestion() else {
+        Authority::Unresolved if matches!(provider, Provider::Steam | Provider::Xbox | Provider::Epic | Provider::Gog | Provider::Windows) => {
+            if provider == Provider::Steam && product_id.is_none() {
+                return;
+            }
+            if provider == Provider::Windows && !is_valid_windows_game(hint_name, game_dir) {
+                return;
+            }
+            let selected = if provider == Provider::Steam {
+                evidence.candidate_executable(hint_name)
+            } else {
+                evidence.manual_suggestion()
+            };
+            let Some(selected) = selected else {
                 eprintln!("No unique declared executable for {}", game_dir.display());
                 return;
             };
+            if is_generic_software_binary(&selected.basename) {
+                return;
+            }
             HdrApp {
                 name: hint_name.trim().to_owned(),
                 exe_name: selected.basename,
                 enabled: false,
                 hdr_type: HdrType::Custom,
-                path: Some(selected.path.to_string_lossy().into_owned()),
+                path: Some(crate::runtime_policy::clean_path_display(&selected.path)),
                 alternate_exes: Vec::new(),
-                steam_id: None,
+                steam_id: (provider == Provider::Steam).then(|| product_id.map(str::to_owned)).flatten(),
                 launcher: Some(provider.launcher().into()),
             }
         }
@@ -1226,5 +1357,36 @@ mod tests {
 
         let by_re7 = database::find_in_catalog("re7.exe");
         assert!(by_re7.is_some(), "Should find Resident Evil 7 by re7.exe");
+    }
+
+    #[test]
+    fn steam_sdr_game_is_suggested_with_auto_off_and_clean_path() {
+        let root = tempfile::tempdir().unwrap();
+        create_files(root.path(), &["sdrgame.exe", "unins000.exe", "UnityCrashHandler64.exe"]);
+        let catalog = database::get_full_catalog();
+        let mut map = ScanCollection::default();
+        match_and_insert_game(&catalog, "SDR Game Title", root.path(), &[], &mut map, Provider::Steam, Some("999999"));
+        assert_eq!(map.detected.len(), 1);
+        assert!(map.verified.is_empty());
+        let app = map.detected.values().next().unwrap();
+        assert_eq!(app.name, "SDR Game Title");
+        assert_eq!(app.exe_name, "sdrgame.exe");
+        assert!(!app.enabled);
+        assert_eq!(app.hdr_type, HdrType::Custom);
+        assert_eq!(app.launcher.as_deref(), Some("Steam"));
+        assert_eq!(app.steam_id.as_deref(), Some("999999"));
+        assert!(!app.path.as_deref().unwrap().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn windows_registry_scanner_ignores_non_game_desktop_software() {
+        assert!(is_known_non_game_software("AIDA64 Extreme v8.20"));
+        assert!(is_known_non_game_software("AMD Ryzen Master"));
+        assert!(is_known_non_game_software("7-Zip 23.01 (x64)"));
+        assert!(is_known_non_game_software("Discord"));
+        assert!(is_known_non_game_software("Google Chrome"));
+        assert!(is_known_non_game_software("OBS Studio"));
+        assert!(!is_known_non_game_software("Borderlands: Game of the Year Enhanced"));
+        assert!(!is_known_non_game_software("Cyberpunk 2077"));
     }
 }

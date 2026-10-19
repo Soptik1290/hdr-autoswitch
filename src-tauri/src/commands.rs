@@ -330,15 +330,29 @@ pub fn remove_app(
     state: State<'_, AppState>,
     expected_context: String,
     exe_name: String,
+    path: Option<String>,
 ) -> Result<ConfigSnapshot, String> {
     state.ensure_admission()?;
     let result = state
         .config_mgr
         .mutate(&expected_context, None, true, |settings| {
             let before = settings.apps.len();
-            settings
-                .apps
-                .retain(|entry| !entry.exe_name.eq_ignore_ascii_case(&exe_name));
+            let norm_target = path
+                .as_deref()
+                .and_then(crate::runtime_policy::normalize_windows_path);
+            settings.apps.retain(|entry| {
+                if !entry.exe_name.eq_ignore_ascii_case(&exe_name) {
+                    return true;
+                }
+                if let Some(target_path) = &norm_target {
+                    let entry_path = entry
+                        .path
+                        .as_deref()
+                        .and_then(crate::runtime_policy::normalize_windows_path);
+                    return entry_path.as_ref() != Some(target_path);
+                }
+                false
+            });
             if settings.apps.len() == before {
                 return Err(
                     "This game is no longer in the library. Refresh before editing it.".into(),
@@ -355,16 +369,32 @@ pub fn toggle_app(
     state: State<'_, AppState>,
     expected_context: String,
     exe_name: String,
+    path: Option<String>,
     enabled: bool,
 ) -> Result<ConfigSnapshot, String> {
     state.ensure_admission()?;
     let result = state
         .config_mgr
         .mutate(&expected_context, None, true, |settings| {
+            let norm_target = path
+                .as_deref()
+                .and_then(crate::runtime_policy::normalize_windows_path);
             let entry = settings
                 .apps
                 .iter_mut()
-                .find(|entry| entry.exe_name.eq_ignore_ascii_case(&exe_name))
+                .find(|entry| {
+                    if !entry.exe_name.eq_ignore_ascii_case(&exe_name) {
+                        return false;
+                    }
+                    if let Some(target_path) = &norm_target {
+                        let entry_path = entry
+                            .path
+                            .as_deref()
+                            .and_then(crate::runtime_policy::normalize_windows_path);
+                        return entry_path.as_ref() == Some(target_path);
+                    }
+                    true
+                })
                 .ok_or("This game is no longer in the library. Refresh before editing it.")?;
             entry.enabled = enabled;
             Ok(())

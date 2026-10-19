@@ -107,17 +107,24 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
   const [isHdrMatched, setIsHdrMatched] = useState(false);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
 
-  const handleToggleApp = async (exeName: string, enabled: boolean) => {
+  const handleToggleApp = async (app: HdrApp, enabled: boolean) => {
     try {
-      await configClient.mutate('toggle_app', { exeName, enabled });
+      await configClient.mutate('toggle_app', {
+        exeName: app.exe_name,
+        ...(app.path ? { path: app.path } : {}),
+        enabled,
+      });
     } catch (err) {
       configClient.reportError(err);
     }
   };
 
-  const handleDeleteApp = async (exeName: string) => {
+  const handleDeleteApp = async (app: HdrApp) => {
     try {
-      await configClient.mutate('remove_app', { exeName });
+      await configClient.mutate('remove_app', {
+        exeName: app.exe_name,
+        ...(app.path ? { path: app.path } : {}),
+      });
     } catch (err) {
       configClient.reportError(err);
     }
@@ -489,7 +496,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
 
             return (
               <div
-                key={app.exe_name}
+                key={app.path ? `${app.exe_name}|${app.path}` : `${app.exe_name}|${app.name}`}
                 className={`relative group border overflow-hidden flex flex-col justify-between transition-all duration-200 ${
                   app.enabled
                     ? isDark
@@ -562,7 +569,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                   <div className="flex items-center justify-between pt-0.5">
                     {/* Toggle button */}
                     <button
-                      onClick={() => handleToggleApp(app.exe_name, !app.enabled)}
+                      onClick={() => handleToggleApp(app, !app.enabled)}
                       disabled={isQuarantined(app)}
                       className={`px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider cursor-pointer border transition-all ${
                         app.enabled
@@ -586,7 +593,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                       </button>
                     )}
                     <button
-                      onClick={() => handleDeleteApp(app.exe_name)}
+                      onClick={() => handleDeleteApp(app)}
                       className={`p-1 cursor-pointer transition-colors ${
                         isDark ? 'text-[#8a7f81] hover:text-[#f55a6b]' : 'text-slate-400 hover:text-rose-600'
                       }`}
@@ -610,7 +617,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
 
             return (
               <div
-                key={app.exe_name}
+                key={app.path ? `${app.exe_name}|${app.path}` : `${app.exe_name}|${app.name}`}
                 className={`p-3 border transition-all flex items-center justify-between gap-4 relative ${
                   app.enabled
                     ? isDark
@@ -665,7 +672,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
 
                 <div className="flex items-center gap-3 shrink-0">
                   <button
-                    onClick={() => handleToggleApp(app.exe_name, !app.enabled)}
+                    onClick={() => handleToggleApp(app, !app.enabled)}
                     disabled={isQuarantined(app)}
                     className={`px-2.5 py-1 text-xs font-bold uppercase tracking-wider cursor-pointer border transition-all ${
                       app.enabled
@@ -688,7 +695,7 @@ export const AppsManager: React.FC<AppsManagerProps> = ({
                     </button>
                   )}
                   <button
-                    onClick={() => handleDeleteApp(app.exe_name)}
+                    onClick={() => handleDeleteApp(app)}
                     className={`p-1.5 cursor-pointer transition-colors ${
                       isDark ? 'text-[#8a7f81] hover:text-[#f55a6b]' : 'text-slate-400 hover:text-rose-600'
                     }`}

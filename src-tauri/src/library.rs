@@ -35,13 +35,29 @@ pub fn automatic_enrollment_veto(existing: &[HdrApp], candidate: &HdrApp) -> boo
 }
 
 fn same_game(existing: &HdrApp, item: &HdrApp) -> bool {
+    let conflicting_ids = matches!(
+        (&existing.steam_id, &item.steam_id),
+        (Some(left), Some(right)) if left != right
+    );
+    let same_steam_id = matches!(
+        (&existing.steam_id, &item.steam_id),
+        (Some(left), Some(right)) if !left.trim().is_empty() && left == right
+    );
+    let different_paths = matches!(
+        (&existing.path, &item.path),
+        (Some(left), Some(right)) if !same_path(left, right)
+    );
+    let same_name = existing.name.trim().eq_ignore_ascii_case(item.name.trim());
+    if !same_name && (conflicting_ids || (different_paths && !same_steam_id)) {
+        return false;
+    }
     if existing.exe_name.eq_ignore_ascii_case(&item.exe_name) {
         return true;
     }
-    if matches!((&existing.steam_id, &item.steam_id), (Some(left), Some(right)) if left != right) {
+    if conflicting_ids {
         return false;
     }
-    if existing.name.eq_ignore_ascii_case(&item.name) {
+    if same_name {
         return true;
     }
     std::iter::once(&existing.exe_name)
@@ -79,11 +95,23 @@ fn apply_explicit_executables(existing: &mut HdrApp, item: &HdrApp) {
 }
 
 pub fn import_games(config: &mut AppConfig, detected: Vec<HdrApp>) -> Result<(), String> {
-    let mut primaries = std::collections::HashMap::<String, (&HdrApp, Option<&str>)>::new();
+    let mut primaries = Vec::<(&HdrApp, Option<&str>)>::new();
     for item in &detected {
         validate_app(item)?;
-        let primary = item.exe_name.to_lowercase();
-        if let Some((previous, known_id)) = primaries.get_mut(&primary) {
+        if let Some((previous, known_id)) = primaries.iter_mut().find(|(previous, _)| {
+            if !previous.exe_name.eq_ignore_ascii_case(&item.exe_name) {
+                return false;
+            }
+            let same_installation = match (&previous.path, &item.path) {
+                (Some(left), Some(right)) => same_path(left, right),
+                (None, None) => true,
+                _ => false,
+            };
+            same_installation
+                || previous.path.is_none()
+                || item.path.is_none()
+                || same_game(previous, item)
+        }) {
             let same_provider = match (&previous.launcher, &item.launcher) {
                 (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
                 (None, None) => true,
@@ -106,7 +134,7 @@ pub fn import_games(config: &mut AppConfig, detected: Vec<HdrApp>) -> Result<(),
                 *known_id = item.steam_id.as_deref();
             }
         } else {
-            primaries.insert(primary, (item, item.steam_id.as_deref()));
+            primaries.push((item, item.steam_id.as_deref()));
         }
     }
     for mut item in detected {
@@ -1011,4 +1039,45 @@ mod tests {
         existing.exe_name = "BsSndRpt.exe".into();
         assert!(automatic_enrollment_veto(&[existing], &candidate));
     }
+
+    #[test]
+    fn distinct_games_sharing_executable_name_can_be_imported_and_stored_separately() {
+        let mut hl2 = game("Half-Life 2", "hl2.exe");
+        hl2.path = Some(r"C:\Steam\steamapps\common\Half-Life 2\hl2.exe".into());
+        hl2.steam_id = Some("220".into());
+        hl2.launcher = Some("Steam".into());
+
+        let mut portal = game("Portal", "hl2.exe");
+        portal.path = Some(r"C:\Steam\steamapps\common\Portal\hl2.exe".into());
+        portal.steam_id = Some("400".into());
+        portal.launcher = Some("Steam".into());
+
+        let mut soc = game("S.T.A.L.K.E.R.: Shadow of Chernobyl", "xrengine.exe");
+        soc.path = Some(r"D:\Games\STALKER Shadow of Chernobyl\bin\xrEngine.exe".into());
+        let mut cs = game("S.T.A.L.K.E.R.: Clear Sky", "xrengine.exe");
+        cs.path = Some(r"D:\Games\STALKER Clear Sky\bin\xrEngine.exe".into());
+        let mut cop = game("S.T.A.L.K.E.R.: Call of Pripyat", "xrengine.exe");
+        cop.path = Some(r"D:\Games\STALKER Call of Pripyat\bin\xrEngine.exe".into());
+
+        let mut config = AppConfig::default();
+        import_games(
+            &mut config,
+            vec![hl2.clone(), portal.clone(), soc.clone(), cs.clone(), cop.clone()],
+        )
+        .unwrap();
+        assert_eq!(config.apps.len(), 5);
+        assert_eq!(config.apps[0].name, "Half-Life 2");
+        assert_eq!(config.apps[0].path, hl2.path);
+        assert_eq!(config.apps[1].name, "Portal");
+        assert_eq!(config.apps[1].path, portal.path);
+
+        // Moving Half-Life 2 updates only Half-Life 2, leaving Portal untouched
+        let mut moved_hl2 = hl2.clone();
+        moved_hl2.path = Some(r"E:\SteamLibrary\steamapps\common\Half-Life 2\hl2.exe".into());
+        import_games(&mut config, vec![moved_hl2.clone()]).unwrap();
+        assert_eq!(config.apps.len(), 5);
+        assert_eq!(config.apps[0].path, moved_hl2.path);
+        assert_eq!(config.apps[1].path, portal.path);
+    }
 }
+

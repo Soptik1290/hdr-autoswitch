@@ -97,3 +97,45 @@ test('exact-primary matching preserves the established canonical executable key'
   assert.equal(findLibraryApp([existing], incoming), existing);
   assert.equal(findTrackedApp([existing], incoming), existing);
 });
+
+test('distinct games sharing the same executable name do not conflate or trigger false path updates', () => {
+  const hl2 = app({
+    name: 'Half-Life 2',
+    exe_name: 'hl2.exe',
+    path: 'C:\\Steam\\steamapps\\common\\Half-Life 2\\hl2.exe',
+    steam_id: '220',
+  });
+  const portal = app({
+    name: 'Portal',
+    exe_name: 'hl2.exe',
+    path: 'C:\\Steam\\steamapps\\common\\Portal\\hl2.exe',
+    steam_id: '400',
+  });
+  assert.equal(findLibraryApp([hl2], portal), undefined);
+  assert.equal(findTrackedApp([hl2], portal), undefined);
+  assert.equal(findLibraryApp([hl2, portal], portal), portal);
+
+  const metro2033 = app({
+    name: 'Metro 2033 Redux',
+    exe_name: 'metro.exe',
+    path: 'D:\\GOG\\Metro 2033 Redux\\metro.exe',
+    steam_id: null,
+  });
+  const metroLastLight = app({
+    name: 'Metro: Last Light Redux',
+    exe_name: 'metro.exe',
+    path: 'D:\\GOG\\Metro Last Light Redux\\metro.exe',
+    steam_id: null,
+  });
+  assert.equal(findLibraryApp([metro2033], metroLastLight), undefined);
+  assert.equal(findTrackedApp([metro2033], metroLastLight), undefined);
+
+  const movedMetro2033 = app({
+    name: 'Metro 2033 Redux',
+    exe_name: 'metro.exe',
+    path: 'E:\\Moved\\Metro 2033 Redux\\metro.exe',
+    steam_id: null,
+  });
+  assert.equal(findLibraryApp([metro2033], movedMetro2033), metro2033);
+});
+

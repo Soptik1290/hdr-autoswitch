@@ -7,7 +7,7 @@
 **Automatic, lightweight HDR display switcher for Windows 10 and 11.**\
 *No more manual `Win + Alt + B` or monitor blackouts before and after every gaming session.*
 
-[![Version](https://img.shields.io/badge/Version-v1.0.9-5accf5?style=for-the-badge)](https://github.com/Soptik1290/hdr-autoswitch/releases/tag/v1.0.9)
+[![Version](https://img.shields.io/badge/Version-v1.0.10-5accf5?style=for-the-badge)](https://github.com/Soptik1290/hdr-autoswitch/releases/tag/v1.0.10)
 [![Windows](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Soptik1290/hdr-autoswitch)
 [![Tauri v2](https://img.shields.io/badge/Tauri-v2-FFC131?style=for-the-badge&logo=tauri&logoColor=black)](https://v2.tauri.app/)
 [![Rust](https://img.shields.io/badge/Rust-Backend-orange?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -15,7 +15,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Buy%20me%20a%20coffee-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/s0pt1k)
 
-[**Download Latest Release (.exe Installer)**](https://github.com/Soptik1290/hdr-autoswitch/releases/latest) • [**Release Notes**](release-notes/RELEASE_NOTES_v1.0.9.md) • [**Support on Ko-fi**](https://ko-fi.com/s0pt1k) • [**Report Bug**](https://github.com/Soptik1290/hdr-autoswitch/issues)
+[**Download Latest Release (.exe Installer)**](https://github.com/Soptik1290/hdr-autoswitch/releases/latest) • [**Release Notes**](release-notes/RELEASE_NOTES_v1.0.10.md) • [**Support on Ko-fi**](https://ko-fi.com/s0pt1k) • [**Report Bug**](https://github.com/Soptik1290/hdr-autoswitch/issues)
 
 
 </div>
@@ -88,7 +88,7 @@ always recheck current authorization, including after a delayed observation.
 ### Option 1: Pre-built Windows Installer (Recommended)
 Download the latest installer (`.exe` setup or `.msi`) from the [**Releases Page**](https://github.com/Soptik1290/hdr-autoswitch/releases/latest).
 
-1. Run `HDR Auto-Switch_1.0.9_x64-setup.exe`.
+1. Run `HDR Auto-Switch_1.0.10_x64-setup.exe`.
 2. Follow the installer instructions (creates desktop and start menu shortcuts).
 3. The app will detect your connected displays automatically.
 4. Click **"Scan PC for Games"** on the My Games tab to populate your library.
@@ -157,8 +157,8 @@ To compile the release binaries and generate Windows NSIS and MSI installers:
 npm run tauri build
 ```
 Output files will be generated in:
-- `src-tauri/target/release/bundle/nsis/HDR Auto-Switch_1.0.9_x64-setup.exe`
-- `src-tauri/target/release/bundle/msi/HDR Auto-Switch_1.0.9_x64_en-US.msi`
+- `src-tauri/target/release/bundle/nsis/HDR Auto-Switch_1.0.10_x64-setup.exe`
+- `src-tauri/target/release/bundle/msi/HDR Auto-Switch_1.0.10_x64_en-US.msi`
 
 ### Checks without changing real HDR or installed settings
 
